@@ -1,0 +1,23 @@
+# 依赖（本项目零依赖，装了也不进库）
+node_modules/
+package-lock.json
+
+# 本地临时/调试产物
+.tmp/
+.agent/
+.agent-todo.json
+tmp/
+*.log
+*.bak
+*.orig
+
+# 画图插件的中间产物 & 调试脚本
+drawings/
+dnspyhelp.txt
+d2.txt
+plugins/dnspy.js
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,47 @@
+{
+  "name": "auroratui",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "AuroraTui — 终端里的 AI 编程代理（零依赖 TUI，支持子代理与浏览器团队面板）",
+  "bin": {
+    "auroratui": "bin/agent.js",
+    "agent": "bin/agent.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/agent.js",
+    "test": "node test/run.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "plugins/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "tui",
+    "terminal",
+    "cli",
+    "llm",
+    "coding-agent",
+    "multi-agent",
+    "openai",
+    "anthropic"
+  ],
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mmr-God/auroratui.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mmr-God/auroratui/issues"
+  },
+  "homepage": "https://github.com/Mmr-God/auroratui#readme",
+  "dependencies": {}
+}

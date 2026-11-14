@@ -1,0 +1,63 @@
+=== normal frame (100x30) ===
+ ◆ AuroraTui v2.0.0 │ DeepSeek │ 工作区  D:/Works/JS/AIAgent                                        
+                                                                                                 │  
+  先定位到解析逻辑：                                                                             │  
+                                                                                                 │  
+  • marker 由 printf 输出，形如 __AGENT_x__:\d+:cwd                                              ║  
+  • 解析用正则，含 $? 与 $PWD                                                                    ║  
+                                                                                                 ║  
+  ╭─ js · 2 行 ───────────────────────────────────────────────────────────────────────────────╮  ║  
+  │ const m = /^(-?\d+):(.*)$/s.exec(tail.trim());                                               ║  
+  │ if (m) this.cwd = normalizeCwd(m[2]);                                                        ║  
+  ╰────────────────────────────────────────────────────────────────────────────────────────────╯ ║  
+                                                                                                 ║  
+  再看一下 测试 结果：                                                                           ║  
+                                                                                                 ║  
+  √ ↑ shell node --test test/ 820ms                                                              ║  
+    ✔ marker 解析 (12ms)                                                                         ║  
+    ✔ 输出截断 (3ms)                                                                             ║  
+    ℹ pass 2                                                                                     ║  
+    ℹ fail 0                                                                                     ║  
+                                                                                                 ║  
+  | ·web_search ansi 256 color                                                                   ║  
+                                                                                                 ║  
+  ~ 已折叠为 b1（修复 marker 正则）· 上下文降到 38.2%                                            ║  
+                                                                                                 ║  
+  用法 /model [筛选|provider/model] · 切换模型（打开选择器）                                        
+╭─ Enter 发送 · 拖选复制 · Ctrl+V 粘贴 · Ctrl+J 换行 · / 命令 · Ctrl+C 退出 ────────────────────╮   
+│ > /model deepseek                                                                              │  
+╰────────────────────────────────────────────────────────────────────────────────────────────────╯  
+ ● 就绪  ·  ctx 1%  ·  ↑1.2k ↓340  ·  $0.0012                     DeepSeek · deepseek-flash · off   
+
+=== model picker frame ===
+ ◆ AuroraTui v2.0.0 │ DeepSeek │ 工作区  D:/Works/JS/AIAgent                                        
+                                                                                                 │  
+          ╭─ 选择模型 输入即筛选 · Enter 选择 · ESC 取消 ─────────────────────────────╮             
+          │ / 输入关键词筛选服务商 / 模型                                              │            
+          ├────────────────────────────────────────────────────────────────────────────┤            
+          │ DeepSeek  deepseek · 未配置 key                                            │            
+          │→● deepseek-flash DeepSeek Flash · 1.0M ctx · $0.3 / $1.2                   │            
+          │ ◆ deepseek-v4-pro DeepSeek V4 Pro · 1.0M ctx · $1.32 / $3.96               │            
+          │ OpenAI  openai · 未配置 key                                                │            
+          │ ◆ gpt-5.4 GPT-5.4 · 400k ctx · $1.25 / $10                                 │            
+          │ ◆ gpt-5.4-mini GPT-5.4 mini · 400k ctx · $0.25 / $2                        │            
+          │ ◆ gpt-5.1 GPT-5.1 · 400k ctx · $1.25 / $10                                 │            
+          │ Anthropic  anthropic · 未配置 key                                          │            
+          │ ◆ claude-sonnet-5-5 Claude Sonnet 5.5 · 1.0M ctx · $2 / $10                │            
+          │ ◆ claude-opus-5-5 Claude Opus 5.5 · 1.0M ctx · $4 / $20                    │            
+          │ ◆ claude-haiku-5-5 Claude Haiku 5.5 · 1.0M ctx · $0.1 / $0.5               │            
+          │ ◆ claude-fable-5-1 Claude Fable 5.1 · 1.0M ctx · $10 / $50                 │            
+          │ ◆ claude-opus-4-8 Claude Opus 4.8 · 1.0M ctx · $5 / $25                    │            
+          │ Google Gemini  gemini · 未配置 key                                         │            
+          │ ◆ gemini-3-pro-preview Gemini 3 Pro · 1.0M ctx · $2 / $12                  │            
+          │ ◆ gemini-2.5-pro Gemini 2.5 Pro · 1.0M ctx · $1.25 / $10                   │            
+          │ ◆ gemini-2.5-flash Gemini 2.5 Flash · 1.0M ctx · $0.3 / $2.5               │            
+          ╰────────────────────────────────────────────────────────────────────────────╯            
+                                                                                                 ║  
+  用法 /model [筛选|provider/model] · 切换模型（打开选择器）                                        
+╭─ Enter 发送 · 拖选复制 · Ctrl+V 粘贴 · Ctrl+J 换行 · / 命令 · Ctrl+C 退出 ────────────────────╮   
+│ > /model deepseek                                                                              │  
+╰────────────────────────────────────────────────────────────────────────────────────────────────╯  
+ ● 就绪  ·  ctx 1%  ·  ↑1.2k ↓340  ·  $0.0012                     DeepSeek · deepseek-flash · off   
+
+width check: ok
