@@ -12,7 +12,7 @@ tmp/
 *.orig
 
 # 画图插件的中间产物 & 调试脚本
-drawings/
+/drawings/
 dnspyhelp.txt
 d2.txt
 plugins/dnspy.js

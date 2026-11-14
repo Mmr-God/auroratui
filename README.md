@@ -164,6 +164,22 @@ auroratui --help               # 全部参数
 - **有背景时的诊断**：填了渐变/底色后整幅包围盒天然贴边，工具会把背景色单独判出来，只对「主体」报贴边/太小。
 - 详细用法写在技能里：`skill load draw`（`~/.agent/skills/draw.md`）。
 
+**下边这些图全部是这个插件在本地画出来的**（不是 AI 生图，是 AI 算坐标 + 纯 Node 栅格化 + zlib 编码，零依赖，毫秒级）：
+
+<p align="center"><img src="docs/drawings/wall.png" width="760" alt="draw 插件画出来的 18 个像素角色与道具"></p>
+
+18 个起手配方，模型只需要改细节就能出成品：
+
+| 角色 | | 道具 | |
+| --- | --- | --- | --- |
+| [企鹅](docs/drawings/penguin.png) | [史莱姆](docs/drawings/slime.png) | [剑](docs/drawings/sword.png) | [盾](docs/drawings/shield.png) |
+| [猫](docs/drawings/cat.png) | [小鸟](docs/drawings/bird.png) | [药水](docs/drawings/potion.png) | [宝石](docs/drawings/gem.png) |
+| [幽灵](docs/drawings/ghost.png) | [人形](docs/drawings/humanoid.png) | [箱子](docs/drawings/chest.png) | [树](docs/drawings/tree.png) |
+| [蘑菇](docs/drawings/mushroom.png) | [场景](docs/drawings/scene.png) | [星星](docs/drawings/star.png) | [心](docs/drawings/heart.png) |
+| | | [金币](docs/drawings/coin.png) | [火花](docs/drawings/spark.png) |
+
+图片在 [`docs/drawings/`](docs/drawings/)（源码与重生成脚本一起放在仓库里，随时能重画）。
+
 插件在启动时自动加载（`settings.plugins = false` 可整体关掉）；要求模型支持识图，纯文本模型看不见画面但照样能画，只是得靠 ASCII 预览和诊断来改。
 
 ### 子代理与团队协作（默认关闭，会额外花 token）
