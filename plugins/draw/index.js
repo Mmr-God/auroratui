@@ -155,9 +155,9 @@ export const drawTool = {
     '- 常用 op：fill_ellipse/fill_rect/fill_poly/line/pixel/ellipse/rect/flood_fill/outline_in/outline_out/' +
     'gradient/mirror_x/mirror_y/shift/erase/clear/margin/palette/noise\n' +
     '- 相对坐标：op 里给 "anchor":[x,y]，则 x/y/cx/cy/pts 都按相对锚点的偏移算\n' +
-    '- 颜色：#rrggbb/#rgb 或速记名 black/white/red/green/blue/yellow/orange/purple/pink/brown/gray/gold/navy/sand/skin/sky/grass/wood/steel\n' +
+    '- 颜色：#rrggbb/#rgb/#rrggbbaa（8 位带透明度，如 #00000055 半透明阴影）或速记名 black/white/red/green/blue/yellow/orange/purple/pink/brown/gray/gold/navy/sand/skin/sky/grass/wood/steel\n' +
     '- 每轮建议 5~15 条 op，先用大色块定形，看图后再加细节，最后 outline_in 描边\n' +
-    '- 细节看不清时用 scale:4~8 放大导出（像素画放大不糊），或 read 那个 PNG 路径',
+    '- 细节看不清：scale:4~8 放大导出（像素画放大不糊），或 crop:{x,y,w,h} 只看局部（配 scale:12 看 1~2px 的眼睛）',
   parameters: {
     type: 'object',
     properties: {
