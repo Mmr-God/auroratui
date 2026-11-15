@@ -1646,8 +1646,10 @@ export class App {
         picked: new Set(),
         other: '',
         cur: 0, // 自定义输入的光标位置（可左右移动、能在中间插入粘贴）
+        notice: '', // 多选没勾就按「完成」时的提醒（留在弹层里，不关窗）
         resolve,
       };
+      this.askHits = null; // 上一帧选项/确认行落在哪几行（左键点击用）
       this.input = { text: '', cursor: 0 };
       this.dirty = true;
       this.render(true);
@@ -1658,6 +1660,7 @@ export class App {
     const st = this.askState;
     if (!st) return;
     this.askState = null;
+    this.askHits = null;
     st.resolve?.(result);
     this.dirty = true;
     if (!this.quit) this.render(true);
@@ -1666,8 +1669,11 @@ export class App {
   togglePick(idx) {
     const st = this.askState;
     if (!st) return;
+    // 多选时最后一行是「完成」，不是选项，别把它加成一项
+    if (!(idx >= 0 && idx < st.options.length)) return;
     if (st.picked.has(idx)) st.picked.delete(idx);
     else st.picked.add(idx);
+    st.notice = '';
   }
 
   submitAsk() {
@@ -1678,7 +1684,12 @@ export class App {
       this.push({ kind: 'note', text: `你的回答：${other}` });
       return this.finishAsk({ answer: other });
     }
-    if (st.multi && st.picked.size) {
+    if (st.multi) {
+      // 一项都没勾就提交 = 什么都答不上来：留在弹层里提示，别默默关掉
+      if (!st.picked.size) {
+        st.notice = '还没勾选任何一项：空格 / Enter / 鼠标点击 勾选，再回车「完成」';
+        return;
+      }
       const labels = st.options.filter((_, i) => st.picked.has(i)).map((o) => o.label);
       this.push({ kind: 'note', text: `你的选择：${labels.join(' / ')}` });
       return this.finishAsk({ selections: labels });
@@ -1693,7 +1704,9 @@ export class App {
     const st = this.askState;
     const k = ev.key;
     this.dirty = true;
-    const n = st.options.length || 1;
+    // 多选时末尾多一行「完成」：↑↓ / 滚轮要能走到它，回车才提交
+    const confirmRow = st.multi ? st.options.length : -1;
+    const n = (st.options.length || 1) + (st.multi ? 1 : 0);
     if (k === 'esc' || k === 'ctrl+c') {
       this.push({ kind: 'note', text: '已跳过 AI 的提问（让它自己拿主意继续）' });
       return this.finishAsk(null);
@@ -1706,7 +1719,14 @@ export class App {
       st.sel = (st.sel + 1) % n;
       return;
     }
-    if (k === 'enter') return this.submitAsk();
+    if (k === 'enter') {
+      // 多选：回车 = 勾选/取消光标所在的项。之前回车直接就把高亮项发出去了，
+      // 玩家根本来不及多选；要提交就走到最后一行「完成」回车（手打了答案也直接提交）。
+      if (st.multi && st.sel !== confirmRow && !st.other.trim()) {
+        return this.togglePick(st.sel);
+      }
+      return this.submitAsk();
+    }
     // 自定义输入的光标编辑（粘贴一长串之后要能改中间的字）
     if (k === 'left' || k === 'ctrl+b') {
       st.cur = Math.max(0, this.askCursor() - 1);
@@ -1765,11 +1785,26 @@ export class App {
     if (k === 'paste') return this.pasteIntoAsk(ev.text);
     if (k === 'ctrl+v' || k === 'ctrl+shift+v') return this.pasteIntoAsk();
     if (k === 'mouse-down' && ev.button === 2) return this.pasteIntoAsk();
-    // 弹层里的其它鼠标/滚轮事件不处理，但别让它们掉进文本分支
+    // 鼠标左键点选项就能勾选（多选）/ 选定（单选），滚轮上下挪高亮
+    if (k === 'mouse-down' && ev.button === 0) return this.clickAsk(ev);
+    if (k === 'wheel-up') {
+      st.sel = (st.sel - 1 + n) % n;
+      return;
+    }
+    if (k === 'wheel-down') {
+      st.sel = (st.sel + 1) % n;
+      return;
+    }
+    // 弹层里的其它鼠标事件不处理，但别让它们掉进文本分支
     if (/^(mouse|wheel)/.test(k)) return;
     if (k === 'text') {
       const t = ev.text;
-      if (t === ' ' && st.multi && !st.other) return this.togglePick(st.sel);
+      if (t === ' ' && st.multi && !st.other) {
+        // 多选：空格 = 勾选光标所在的项；停在「完成」行时空格没意义，
+        // 更不能悄悄往答案里塞个空格（否则回车会被当成“已经手打了答案”）
+        if (st.sel !== confirmRow) return this.togglePick(st.sel);
+        return;
+      }
       // 还没开始打字时，数字键 = 直接选第 n 项
       if (!st.other && /^[1-9]$/.test(t) && Number(t) <= st.options.length) {
         const idx = Number(t) - 1;
@@ -1778,6 +1813,28 @@ export class App {
         return this.submitAsk();
       }
       this.askInsert(t);
+    }
+  }
+
+  /**
+   * 弹层里的左键点击：点选项行 = 勾选（多选）/ 直接选定（单选），
+   * 点「完成」行 = 提交，点自定义输入行或空白处什么都不做（照样能打字）。
+   */
+  clickAsk(ev) {
+    const st = this.askState;
+    const hits = this.askHits;
+    if (!st || !hits) return;
+    const y = Number(ev.y);
+    const hit = (hits.rows || []).find((r) => y >= r.from && y <= r.to);
+    if (hit) {
+      st.sel = hit.idx;
+      st.notice = '';
+      if (st.multi) return this.togglePick(hit.idx);
+      return this.submitAsk();
+    }
+    if (hits.confirm != null && y === hits.confirm) {
+      st.sel = st.options.length;
+      return this.submitAsk();
     }
   }
 
@@ -1854,11 +1911,20 @@ export class App {
     const inner = boxW - 4;
     const lines = [];
     const hint = st.multi
-      ? '· 可多选 · ↑↓ 空格/数字 勾选 · ←→ 改答案 · Enter 确认 · 可粘贴(Ctrl+V/右键) · ESC 跳过'
-      : '· 单选 · ↑↓ 数字直选 · ←→ 改答案 · Enter 确认 · 可粘贴(Ctrl+V/右键) · ESC 跳过';
-    const title = ` ${T.accentBold('AI 需要确认')} ${T.dimmer(hint)} `;
+      ? '可多选：空格 / Enter / 点击鼠标 勾选，选完 ↓ 到「完成」回车提交 · Ctrl+V/右键粘贴 · ESC 跳过'
+      : '单选：↑↓ / 数字 / 点击 选择，也可以直接打字 · Ctrl+V/右键粘贴 · ESC 跳过';
+    const title = ` ${T.accentBold('AI 需要确认')} `;
     const titleW = strWidth(stripAnsi(title));
     lines.push(T.dimmer('╭─') + title + T.dimmer('─'.repeat(Math.max(0, boxW - 4 - titleW)) + '╮'));
+    // 提示单独占行并按盒宽换行：多选的说明比单选长，塞进标题栏会把边框顶歪
+    for (const l of wrapWords(hint, Math.max(10, inner - 2)).slice(0, 3)) {
+      lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(l), inner - 2)} ${T.dimmer('│')}`);
+    }
+    if (st.notice) {
+      for (const l of wrapWords(st.notice, Math.max(10, inner - 2)).slice(0, 2)) {
+        lines.push(`${T.dimmer('│')} ${padToWidth(T.warn(l), inner - 2)} ${T.dimmer('│')}`);
+      }
+    }
 
     const qAll = wrapWords(st.question || '（没有问题正文）', Math.max(10, inner - 2));
     const q = qAll.slice(0, 6);
@@ -1885,8 +1951,10 @@ export class App {
       return { labelLines: labelLines.length ? labelLines : [''], descLines };
     });
     const optRows = (b) => b.labelLines.length + b.descLines.length;
-    const budget = Math.max(3, transcriptH - lines.length - 3 - 2);
-    let start = st.sel;
+    const budget = Math.max(3, transcriptH - lines.length - 3 - 3);
+    // 高亮走到「完成」行（sel === options.length）时，窗口按最后一项算，别把选项全滚没
+    const winSel = Math.max(0, Math.min(st.sel, blocks.length - 1));
+    let start = winSel;
     let used = optRows(blocks[start] || { labelLines: [''], descLines: [] });
     while (start > 0 && used + optRows(blocks[start - 1]) <= budget) {
       start--;
@@ -1902,6 +1970,7 @@ export class App {
     if (start > 0) {
       lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(`… 上面还有 ${start} 项`), inner)} ${T.dimmer('│')}`);
     }
+    const hitRows = []; // 每个选项占的行区间 → 左键点击用
     for (let i = start; i < end; i++) {
       const b = blocks[i];
       const sel = i === st.sel;
@@ -1913,6 +1982,7 @@ export class App {
       });
       for (const d of b.descLines) rows.push(`    ${T.dimmer(d)}`);
       const shown = rows.length > budget ? [...rows.slice(0, Math.max(1, budget - 1)), `    ${T.dimmer('…')}`] : rows;
+      const fromRow = lines.length;
       shown.forEach((body, ri) => {
         if (sel) {
           const seg = padToWidth(truncToWidth(body, inner + 1), inner + 1);
@@ -1922,11 +1992,29 @@ export class App {
           lines.push(`${T.dimmer('│')} ${padToWidth(truncToWidth(body, inner), inner)} ${T.dimmer('│')}`);
         }
       });
+      hitRows.push({ from: fromRow, to: lines.length - 1, idx: i });
     }
     if (end < blocks.length) {
       lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(`… 下面还有 ${blocks.length - end} 项`), inner)} ${T.dimmer('│')}`);
     }
+    // 多选的最后一行「完成」：回车到这里（或点它）才提交，勾选过程不再被回车打断
+    let confirmLine = -1;
+    if (st.multi) {
+      const active = st.sel >= st.options.length;
+      const label = st.picked.size
+        ? `完成选择（已选 ${st.picked.size} 项，回车提交）`
+        : '完成选择（先勾选，再回车提交）';
+      const body = `${T.ok('[✓]')} ${active ? T.accentBold(label) : T.white(label)}`;
+      confirmLine = lines.length;
+      if (active) {
+        const seg = padToWidth(truncToWidth(body, inner + 1), inner + 1);
+        lines.push(`${T.dimmer('│')}${bg}${T.ok('→')}${seg}${reset}${T.dimmer('│')}`);
+      } else {
+        lines.push(`${T.dimmer('│')} ${padToWidth(truncToWidth(body, inner), inner)} ${T.dimmer('│')}`);
+      }
+    }
     lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+    const inputLine = lines.length;
     // 自定义输入行：带光标（粘贴一长串后要能看出光标在哪、能在中间接着输），
     // 文本超宽时窗口跟着光标走，不会把正在改的地方截掉。
     // 宽度对齐：'│ ' + '> ' + room + ' │' 要等于上面各行的 '│ ' + inner-2 + ' │'
@@ -1976,6 +2064,17 @@ export class App {
     lines.push(T.dimmer('╰' + '─'.repeat(boxW - 2) + '╯'));
 
     const startRow = 1 + Math.max(0, Math.floor((transcriptH - lines.length) / 2));
+    // 记下选项 / 完成行 / 输入行各落在屏幕的哪一行：点击要先知道点的是哪一项
+    const rowOf = (i) => startRow + i;
+    try {
+      this.askHits = {
+        rows: hitRows.map((h) => ({ from: rowOf(h.from), to: rowOf(h.to), idx: h.idx })),
+        confirm: confirmLine >= 0 ? rowOf(confirmLine) : null,
+        input: rowOf(inputLine),
+      };
+    } catch {
+      this.askHits = null;
+    }
     const padL = Math.max(0, Math.floor((W - boxW) / 2));
     const padR = Math.max(0, W - boxW - padL);
     lines.forEach((ln, i) => {
