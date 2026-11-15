@@ -10,7 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const here = path.dirname(__filename);
 const load = (rel) => import(pathToFileURL(path.join(here, '..', rel)).href);
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const APP_NAME = 'AuroraTui';
 
 // Windows 控制台窗口标题 / *nix 进程名都跟着它走（截图里 cmd 上方那行名字）

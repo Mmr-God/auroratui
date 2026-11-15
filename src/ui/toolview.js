@@ -85,8 +85,10 @@ export function describeTool(item = {}) {
   if (name === 'skill') {
     const sk = meta.skill || null;
     const loading = String(input.action || '').toLowerCase() === 'load';
-    view.label = sk?.name || (loading ? String(input.name || '') : name) || name;
-    view.tags.push(tag('技能', 'skill'));
+    // 调技能渲染成「Call Skill: 技能名」——一眼看出在调哪个技能，而不是干巴巴一个 skill
+    const skName = sk?.name || (loading ? String(input.name || '') : '');
+    view.label = skName ? `Call Skill: ${skName}` : name;
+    if (!loading) view.tags.push(tag('技能', 'skill'));
     if (sk?.scope) view.tags.push(tag(sk.scope));
     if (sk?.chars) view.tags.push(tag(`${fmtNum(sk.chars)} 字`));
     if (sk?.description) view.summary = oneLine(sk.description);

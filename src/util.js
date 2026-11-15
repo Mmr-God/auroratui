@@ -169,46 +169,62 @@ export function wrapWords(str, width, opts = {}) {
   const { hang = 0, prefix = '', hangPrefix = null } = opts;
   const out = [];
   const paras = str.split('\n');
-  for (let pi = 0; pi < paras.length; pi++) {
-    const para = paras[pi];
-    const pfx = out.length === 0 ? prefix : hangPrefix ?? prefix;
-    const avail = Math.max(4, width - strWidth(pfx) - (out.length === 0 ? 0 : hang));
+  for (const para of paras) {
     if (para === '') {
-      out.push(pfx.replace(/\s+$/, ''));
+      out.push(prefix.replace(/\s+$/, ''));
       continue;
     }
-    // tokenise into ANSI-atoms + words
     const atoms = ansiAtoms(para);
+    let lineNo = 0; // 本段已经写出的行数（决定前缀与挂进缩进）
     let cur = '';
     let curW = 0;
-    let firstOnLine = true;
+    const pfx = () => (lineNo === 0 ? prefix : hangPrefix ?? prefix);
+    const avail = () => Math.max(4, width - strWidth(pfx()) - (lineNo === 0 ? 0 : hang));
+    const flush = () => {
+      out.push(pfx() + cur.replace(/\s+$/, ''));
+      cur = '';
+      curW = 0;
+      lineNo++;
+    };
     for (const a of atoms) {
-      const w = strWidth(a.text);
-      if (firstOnLine && w > avail) {
-        // hard break long token
-        let rest = a;
-        while (strWidth(rest.text) > avail) {
-          const [head, tail] = cutAnsi(rest.text, avail);
-          out.push((firstOnLine ? pfx : pfx + '') + head);
-          rest = { ansi: rest.ansi, text: tail };
-          firstOnLine = false;
-        }
-        cur = rest.text;
-        curW = strWidth(cur);
-        firstOnLine = false;
+      const text = a.text;
+      const w = strWidth(text);
+      if (curW === 0 && /^\s+$/.test(text)) continue;
+      if (curW + w <= avail()) {
+        cur += text;
+        curW += w;
         continue;
       }
-      if (!firstOnLine && curW + w > avail) {
-        out.push(pfx + cur.replace(/\s+$/, ''));
-        cur = '';
-        curW = 0;
-        firstOnLine = true;
-        if (/^\s+$/.test(a.text)) continue;
+      if (w <= avail()) {
+        flush();
+        if (/^\s+$/.test(text)) continue;
+        cur = text;
+        curW = w;
+        continue;
       }
-      cur += a.text;
-      curW += w;
+      // 单个片段本身比一行还长：先把当前行剩余空间填满，再按行宽硬切开
+      let rest = text;
+      if (curW > 0) {
+        const room = avail() - curW;
+        if (room > 2) {
+          const [head, tail] = cutAnsi(rest, room);
+          cur += head;
+          curW += strWidth(head);
+          rest = tail;
+        }
+        flush();
+      }
+      while (strWidth(rest) > avail()) {
+        const [head, tail] = cutAnsi(rest, avail());
+        out.push(pfx() + head);
+        lineNo++;
+        rest = tail;
+      }
+      cur = rest;
+      curW = strWidth(rest);
     }
-    out.push(pfx + cur.replace(/\s+$/, ''));
+    if (curW > 0) flush();
+    else if (lineNo === 0) out.push(pfx());
   }
   return out;
 }

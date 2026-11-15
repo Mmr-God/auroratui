@@ -17,7 +17,11 @@ function normOptions(raw) {
     } else if (typeof o === 'object') {
       const label = String(o.label ?? o.title ?? o.text ?? o.value ?? '').trim();
       if (!label) continue;
-      out.push({ label, desc: String(o.desc ?? o.description ?? '') });
+      out.push({
+        label,
+        desc: String(o.desc ?? o.description ?? ''),
+        recommended: !!(o.recommended ?? o.recommend),
+      });
     }
   }
   return out.slice(0, 9);
@@ -30,6 +34,7 @@ export const askTool = {
     '向玩家提问并等待回答。当你不确定玩家意图、缺少关键信息、或要在几种方案之间取舍时，' +
     '用这个工具给出 2-5 个具体选项让玩家选，而不是自己猜着做。' +
     '玩家可以选择其中一个选项（multi=false）或多个选项（multi=true），也可以自己输入选项以外的答案。' +
+    '如果有一个选项明显更合适，把它标成 recommended:true，界面会在选项后加「（推荐）」，帮玩家快速决定。' +
     '需要改文件/删东西/不可逆操作但信息不足时，优先先问。',
   parameters: {
     type: 'object',
@@ -37,8 +42,23 @@ export const askTool = {
       question: { type: 'string', description: '要问玩家的问题，一句话说清，别啰嗦' },
       options: {
         type: 'array',
-        items: { type: 'string' },
-        description: '2-5 个选项，简短明确（例如 "只改 src/ui/app.js" / "顺带改测试"）',
+        description:
+          '2-5 个选项，简短明确（例如 "只改 src/ui/app.js" / "顺带改测试"）。' +
+          '每项可以只写字符串，也可以写成 {label, desc, recommended}：desc 是补充说明，recommended:true 表示你推荐这一项（界面显示「（推荐）」，最多标一个）。',
+        items: {
+          anyOf: [
+            { type: 'string' },
+            {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: '选项正文' },
+                desc: { type: 'string', description: '可选的一行补充说明' },
+                recommended: { type: 'boolean', description: '是否推荐玩家选这个' },
+              },
+              required: ['label'],
+            },
+          ],
+        },
       },
       multi: { type: 'boolean', description: '是否可多选，默认 false' },
       default: { type: 'string', description: '玩家不想选时的默认答案（可选）' },

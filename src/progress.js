@@ -7,6 +7,10 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 
+import { jobs } from './jobs.js';
+import { shellHtml } from './pages/shell.js';
+import { spawnHtml } from './pages/spawn.js';
+
 const LOG_MAX = 300;
 const FLUSH_MS = 180;
 
@@ -203,6 +207,8 @@ export class ProgressHub {
     this.flushTimer = null;
     /** 玩家在面板里给成员传话：由 Team.attachHub 挂上来。 */
     this.onSay = null;
+    /** 玩家在 /spawn 页面手动开工：由 App 启动时挂上来。 */
+    this.onSpawn = null;
     this.state = {
       title: 'AuroraTui · 团队面板',
       team: null,
@@ -363,6 +369,67 @@ function handle(hub, req, res) {
   }
   if (path === '/health') return json(200, { ok: true, url: hub.url });
   if (path === '/api/state') return json(200, hub.snapshot());
+
+  // ---- shell 后端：列表 / 详情（含实时输出）/ 终止 / 清空
+  if (path === '/shell') {
+    const html = shellHtml();
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(html) });
+    return res.end(html);
+  }
+  if (path === '/spawn') {
+    const html = spawnHtml();
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(html) });
+    return res.end(html);
+  }
+  if (path === '/api/shell' && req.method === 'GET') {
+    const id = url.searchParams.get('id');
+    if (id) {
+      const j = jobs.get(id);
+      if (!j) return json(404, { ok: false, error: 'not found' });
+      return json(200, {
+        ok: true,
+        job: {
+          id: j.id, command: j.command, cwd: j.cwd, source: j.source, status: j.status, code: j.code,
+          started: j.started, ended: j.ended, dur: j.dur, bytes: j.bytes, truncated: j.truncated,
+          output: j.output || j.tail || '',
+        },
+      });
+    }
+    return json(200, { ok: true, jobs: jobs.list(80), running: jobs.jobs.filter((j) => j.status === 'running').length });
+  }
+  if (path === '/api/shell/kill' && req.method === 'POST') {
+    return readBody(req).then((raw) => {
+      let body = {};
+      try { body = JSON.parse(raw || '{}'); } catch {}
+      const out = jobs.kill(String(body.id || ''));
+      return json(out.ok ? 200 : 409, out);
+    });
+  }
+  if (path === '/api/shell/clear' && req.method === 'POST') {
+    const kept = jobs.clear();
+    return json(200, { ok: true, content: kept ? `已清空历史，保留 ${kept} 个运行中的任务。` : '已清空。' });
+  }
+
+  // ---- 浏览器手动开工：组队 / 派子代理
+  if (path === '/api/spawn' && req.method === 'POST') {
+    return readBody(req, 256 * 1024).then(async (raw) => {
+      let body = {};
+      try {
+        body = JSON.parse(raw || '{}');
+      } catch {
+        return json(400, { ok: false, content: '请求体不是 JSON。' });
+      }
+      if (typeof hub.onSpawn !== 'function') {
+        return json(409, { ok: false, content: '终端里的主程序还没接上开工接口：请在终端执行 /progress open 后再试。' });
+      }
+      try {
+        const out = await hub.onSpawn(body);
+        return json(out?.ok ? 200 : 409, { ok: !!out?.ok, content: String(out?.content || ''), url: out?.url || hub.url });
+      } catch (e) {
+        return json(500, { ok: false, content: `开工失败：${e?.message || e}` });
+      }
+    });
+  }
   // 玩家在面板里给某个成员传话
   if (path === '/api/say' && req.method === 'POST') {
     return readBody(req).then((raw) => {
@@ -641,6 +708,11 @@ export function dashboardHtml() {
     <div class="brand">
       <h1><b>AuroraTui</b> · 团队面板 <span class="live off" id="live">连接中</span></h1>
       <div class="sub" id="sub">点左边的成员，看他那一整段对话</div>
+      <div class="sub" style="margin-top:6px">
+        <a href="/shell" target="_blank" style="color:var(--accent);text-decoration:none">Shell 任务</a>
+        <span style="color:var(--faint)"> · </span>
+        <a href="/spawn" target="_blank" style="color:var(--accent);text-decoration:none">手动开工</a>
+      </div>
     </div>
     <div class="railhead">成员 <span class="n" id="mcount">0/0</span></div>
     <div class="list" id="list"></div>

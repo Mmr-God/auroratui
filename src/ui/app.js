@@ -33,6 +33,7 @@ import {
   clamp,
   cutAnsi,
   timeAgo,
+  estimateTokens,
 } from '../util.js';
 import { SESSIONS_DIR, AGENT_DIR } from '../config.js';
 import { readClipboard, writeClipboard, readClipboardImage, quotePath } from './clipboard.js';
@@ -45,7 +46,7 @@ import { disposeShell } from '../tools/shell.js';
 import { describeHooks } from '../tools/hooks.js';
 import { findBrowser } from '../tools/browser.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const APP_NAME = 'AuroraTui';
 
 const WELCOME = [
@@ -104,6 +105,9 @@ const COMMANDS = [
   { name: '/subagents', args: '[on|off]', desc: '子代理开关（AI 可派生助手）' },
   { name: '/team', args: '[on|off]', desc: '团队协作开关（AI 可组队并行）' },
   { name: '/progress', args: '[open]', desc: '团队面板（浏览器看进度）' },
+  { name: '/shell', args: '[open]', desc: 'Shell 后端（看/终止 AI 跑过的命令）' },
+  { name: '/spawn', args: '', desc: '在浏览器里手动组队/派子代理' },
+  { name: '/queue', args: '[clear|drop n]', desc: '待发队列（AI 干活时 Tab 排队；Enter 直接插话）' },
   { name: '/todo', args: '[list|set|clear]', desc: '查看/维护待办' },
   { name: '/memory', args: '[list|set|forget]', desc: '查看/维护长期记忆' },
   { name: '/verbose', args: '', desc: '工具输出预览 详细/精简' },
@@ -136,6 +140,9 @@ const HELP = [
   '/subagents [on|off]  子代理：允许 AI 派独立上下文的助手干活（默认关，会多花 token）',
   '/team [on|off]       团队协作：允许 AI 组队并行开发（默认关，token 消耗成倍）',
   '/progress [open]     打开团队面板（浏览器看子代理/团队成员实时进度）',
+  '/shell [open]        Shell 后端：AI 跑过的每条命令、实时输出、手动终止',
+  '/spawn               在浏览器里手动组队或派一个子代理（玩家亲自开工）',
+  '/queue [clear|drop n] 待发队列：AI 干活时按 Tab 排队，收工后自动发送（最多 5 条）；直接 Enter 是插话，当前步骤结束后生效',
   '/verbose             切换工具输出预览（详细/精简）',
   '/sessions            查看已保存会话     /resume <n>  恢复',
   '/history             历史对话列表（↑↓ 选择，Enter 恢复）',
@@ -195,6 +202,15 @@ export class App {
     this.toolCount = 0;
     this.taskT0 = 0; // 本次任务开始时间（状态栏实时用时）
     this.lastElapsed = null; // 上一次任务总用时
+    // 流式速度（tok/s）与帧差分
+    this.speed = 0;
+    this.lastSpeed = null;
+    this._gen = { t0: 0, tok: 0 };
+    this._painted = null;
+    this.pastes = [];
+    /** 待发队列：AI 干活时玩家按 Tab 附加的话，最多 5 条，本轮结束后自动逐条发送。 */
+    this.pending = [];
+    this.maxPending = 5; // 大段粘贴折叠：⟦粘贴#1:12345⟧ → 原文，发送时展开
     // selection / clipboard / history / checkpoints
     this.sel = null; // {a:{row,col}, b:{row,col}} in screen coordinates
     this.selDragging = false;
@@ -211,6 +227,28 @@ export class App {
   }
 
   // ------------------------------------------------------------- lifecycle
+  /** 面板起来后，把「浏览器手动开工」接到 spawnFromBrowser。 */
+  bindSpawn(hub = null) {
+    const attach = (h) => {
+      if (!h) return;
+      h.onSpawn = async (payload) => {
+        const { spawnFromBrowser } = await import('../spawn.js');
+        return spawnFromBrowser(
+          {
+            config: this.config,
+            cwd: this.cwd,
+            checkpoints: this.checkpoints,
+            emit: (item) => this.push(item),
+          },
+          payload,
+        );
+      };
+    };
+    if (hub) return attach(hub);
+    ensureHub(this.config).then(attach).catch(() => {});
+    return undefined;
+  }
+
   async start() {
     const out = process.stdout;
     if (!out.isTTY) {
@@ -253,6 +291,7 @@ export class App {
     out.on('resize', this.onResize);
 
     this.pushWelcome();
+    this.bindSpawn();
     this.render(true);
     // console size sometimes settles a moment after the window is created
     setTimeout(() => {
@@ -449,7 +488,7 @@ export class App {
   paintNow() {
     this.dirty = true;
     const now = Date.now();
-    if (now - (this._lastPaint || 0) < 22) return;
+    if (now - (this._lastPaint || 0) < 16) return;
     // 刚敲完键盘/输入法刚上屏时先别抢刷新：整屏重绘会冲掉输入法的组合串（conhost 下尤其明显）
     if (now - (this.lastInputAt || 0) < 90) return;
     this._lastPaint = now;
@@ -472,23 +511,29 @@ export class App {
     const H = frame.length;
     const cur = this.cursorPos;
     const out = ['\x1b[?7l'];
+    const fullRepaint = force || this.needClear || !this._painted || this._paintedH !== H;
     if (this.needClear) {
       out.push('\x1b[1;1H\x1b[2J');
       this.needClear = false;
       this.drawnRows = 0;
     }
-    // Absolute addressing: each row is written with CUP, so the frame always lands
-    // on screen rows 1..H inside the alt buffer — no cursor bookkeeping, no drift.
+    // 帧差分：只重写变化的行。流式时每帧通常只有最后几行在变，
+    // 整屏重绘是闪烁和卡顿的主因。
+    const next = new Array(H);
     for (let i = 0; i < H; i++) {
+      const line = frame[i] || '';
+      next[i] = line;
+      if (!fullRepaint && this._painted[i] === line) continue;
       out.push(`\x1b[${i + 1};1H\x1b[2K`);
-      if (frame[i]) out.push(frame[i]);
-      // Wipe anything to the right of the frame (conhost leaves stale cells after a resize).
+      if (line) out.push(line);
       out.push('\x1b[0K');
     }
     // Clear everything below the frame, including the spare row: conhost keeps
     // stale cells there after a resize.
     const clearTo = Math.max(this.drawnRows || 0, H + 1);
     for (let i = H; i < clearTo; i++) out.push(`\x1b[${i + 1};1H\x1b[2K`);
+    this._painted = next;
+    this._paintedH = H;
     this.drawnRows = H + 1;
     this.blockRows = H;
     this.lastRow = H;
@@ -824,6 +869,9 @@ export class App {
       segs.push(T.dim(fmtMoney(this.usage.cost)));
     }
     if (this.toolCount) segs.push(T.dim(`* ${this.toolCount}`));
+    // token 速度：流式时实时估算，收到 usage 后用真实输出 token 校正
+    const speed = this.running ? this.speed : this.lastSpeed;
+    if (speed > 0) segs.push(this.running ? T.accent2(`⚡${Math.round(speed)} tok/s`) : T.dim(`⚡${Math.round(speed)} tok/s`));
     const left = ' ' + segs.join(T.dimmer('  ·  '));
     const think = this.config.settings.thinking || 'medium';
     // Right side: provider · model · think, dropped piece by piece when narrow.
@@ -893,7 +941,7 @@ export class App {
       : cancelling
         ? ` ${T.warn('中断中…')} ${T.dimmer('· 再按 ESC 强制结束')} `
         : busy
-          ? ` ${T.warn('ESC 中断')} ${T.dimmer('· Enter 追加指令 · Ctrl+O 思考')} `
+          ? ` ${T.warn('ESC 中断')} ${T.dimmer('· Enter 插话 · Tab 排队 · Ctrl+O 思考')}${this.pending.length ? T.accent2(` · 待发 ${this.pending.length}/${this.maxPending} `) : ''} `
           : ` ${T.dim('Enter 发送')} ${T.dimmer('· 拖选复制 · Ctrl+V 粘贴 · Ctrl+J 换行 · / 命令 · Ctrl+C 退出')} `;
     const labelW = strWidth(stripAnsi(label));
     const top = T.dimmer('╭─') + label + T.dimmer('─'.repeat(Math.max(0, W - 4 - labelW)) + '╮');
@@ -917,6 +965,14 @@ export class App {
       out.push(`${T.dimmer('│')} ${promptStr}${T.plain(padded)} ${T.dimmer('│')}`);
     }
     out.push(T.dimmer('╰' + '─'.repeat(W - 2) + '╯'));
+    if (this.pending.length) {
+      const tag = T.accent2(` ⏳ 待发 ${this.pending.length}/${this.maxPending} `);
+      const room = Math.max(0, W - strWidth(stripAnsi(tag)) - 2);
+      const listText = this.pending
+        .map((t, i) => `${i + 1}. ${String(t).replace(/\s+/g, ' ').trim()}`)
+        .join('   ');
+      out.unshift(T.plain(' ') + tag + T.dimmer(truncToWidth(listText, room)));
+    }
     this.inputView = { rows, cursorRow, cursorCol, inner, offset, avail };
     return out;
   }
@@ -1146,7 +1202,7 @@ export class App {
         const paths = (img.paths && img.paths.length ? img.paths : [img.path]).map(quotePath).join(' ');
         if (this.running) {
           this.agent.queue(paths);
-          this.push({ kind: 'note', text: `剪贴板里是图片，已排队图片路径，等本轮结束后发送`, inline: true });
+          this.push({ kind: 'note', text: `剪贴板里是图片，已插话图片路径（当前步骤结束后生效）`, inline: true });
           this.dirty = true;
           return this.render(true);
         }
@@ -1168,16 +1224,16 @@ export class App {
       this.dirty = true;
       return this.render(true);
     }
-    const long = text.length > 20000;
-    if (long) text = text.slice(0, 20000);
+    const long = text.length > 200000;
+    if (long) text = text.slice(0, 200000);
     if (this.running) {
       this.agent.queue(text.trim());
-      this.push({ kind: 'note', text: `已排队 ${text.length} 字符，等本轮结束后发送`, inline: true });
+      this.push({ kind: 'note', text: `已插话 ${text.length} 字符（当前步骤结束后生效）`, inline: true });
       this.dirty = true;
       return this.render(true);
     }
-    this.insertText(text);
-    this.push({ kind: 'note', text: `已粘贴 ${text.length} 字符${long ? '（超长已截断）' : ''}`, inline: true });
+    this.insertPasted(text);
+    this.push({ kind: 'note', text: `已粘贴 ${text.length} 字符${long ? '（超长已截断）' : ''}${text.length >= 1200 ? '，折叠成占位符' : ''}`, inline: true });
     this.dirty = true;
     this.render(true);
   }
@@ -1442,7 +1498,10 @@ export class App {
       }
       case 'assistant': {
         if (item.text && item.text.trim()) {
-          const body = renderMarkdown(item.text, width);
+          const body = renderMarkdown(item.text, width, {
+            streaming: !!item.streaming,
+            maxLines: item.collapsed ? 24 : this.verbose ? 200 : 90,
+          });
           const limit = this.verbose ? 40 : 16;
           if (item.collapsible && item.collapsed && body.length > limit) {
             out.push(...body.slice(0, limit - 2));
@@ -1463,8 +1522,10 @@ export class App {
         const secs = (ms / 1000).toFixed(1) + 's';
         const open = item.done ? !item.collapsed : true;
         if (item.done) {
+          // 收工后保持和 “Thinking…” 同一套黄色高亮，别突然褪成灰色
           const arrow = open ? glyphs.arrowUp : glyphs.arrowDown;
-          out.push(`  ${T.dimmer(arrow)} ${T.dim(`Thought for ${secs}`)}${open ? '' : T.dimmer(' · 点击展开')}`);
+          const label = T.bold(T.warn(`Thought for ${secs}`));
+          out.push(`  ${T.warn(arrow)} ${label}${open ? '' : T.warn(' · 点击展开')}`);
         } else {
           out.push(`  ${T.warn(spinnerFrame(this.spin))} ${T.bold(T.warn(`Thinking\u2026 ${secs}`))}`);
         }
@@ -1799,27 +1860,71 @@ export class App {
     const titleW = strWidth(stripAnsi(title));
     lines.push(T.dimmer('╭─') + title + T.dimmer('─'.repeat(Math.max(0, boxW - 4 - titleW)) + '╮'));
 
-    const q = wrapWords(st.question || '（没有问题正文）', Math.max(10, inner - 2)).slice(0, 3);
+    const qAll = wrapWords(st.question || '（没有问题正文）', Math.max(10, inner - 2));
+    const q = qAll.slice(0, 6);
+    if (qAll.length > q.length) q[5] = truncToWidth(q[5] + ' …', inner - 4);
     for (const l of q) lines.push(`${T.dimmer('│')} ${padToWidth(T.white(l), inner - 2)} ${T.dimmer('│')}`);
     if (st.def) lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(`不选时默认：${st.def}`), inner - 2)} ${T.dimmer('│')}`);
     lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
 
-    const maxOpt = Math.max(3, Math.min(st.options.length, Math.max(3, transcriptH - 9)));
-    st.options.slice(0, maxOpt).forEach((o, i) => {
-      const mark = st.multi ? (st.picked.has(i) ? T.ok('[x]') : T.dimmer('[ ]')) : i === st.sel ? T.accent('(●)') : T.dimmer('( )');
-      const label = truncToWidth(`${i + 1}. ${o.label}`, Math.max(6, inner - 9));
-      const room = Math.max(0, inner - 8 - strWidth(label));
-      const desc = o.desc && room > 4 ? T.dimmer(' ' + truncToWidth(o.desc, room)) : '';
-      const body = `${mark} ${i === st.sel ? T.accentBold(label) : T.white(label)}${desc}`;
-      if (i === st.sel) {
-        const seg = padToWidth(truncToWidth(body, inner), inner);
-        lines.push(`${T.dimmer('│')}\x1b[48;5;238m${T.accent('→')}${seg}\x1b[0m${T.dimmer('│')}`);
-      } else {
-        lines.push(`${T.dimmer('│')} ${padToWidth(truncToWidth(body, inner), inner)} ${T.dimmer('│')}`);
-      }
+    // 选项正文按盒宽自动换行：长选项不再挤成一行被截断，说明文字也换行显示。
+    // 选项太多时只滚动窗口（跟着选中项走），并提示上下还藏了几项。
+    const textW = Math.max(12, inner - 4);
+    const bg = String.fromCharCode(27) + '[48;5;238m';
+    const reset = String.fromCharCode(27) + '[0m';
+    const blocks = st.options.map((o, i) => {
+      const rec = o.recommended ? '（推荐）' : '';
+      const labelLines = wrapWords(`${i + 1}. ${o.label}${rec}`, textW)
+        .map((l) => l.replace(/ +$/, ''))
+        .filter((l, idx, arr) => l || arr.length === 1);
+      const descLines = o.desc
+        ? wrapWords(o.desc, textW)
+            .map((l) => l.replace(/ +$/, ''))
+            .filter((l, idx, arr) => l || arr.length === 1)
+        : [];
+      return { labelLines: labelLines.length ? labelLines : [''], descLines };
     });
-    if (st.options.length > maxOpt) {
-      lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(`… 还有 ${st.options.length - maxOpt} 项`), inner)} ${T.dimmer('│')}`);
+    const optRows = (b) => b.labelLines.length + b.descLines.length;
+    const budget = Math.max(3, transcriptH - lines.length - 3 - 2);
+    let start = st.sel;
+    let used = optRows(blocks[start] || { labelLines: [''], descLines: [] });
+    while (start > 0 && used + optRows(blocks[start - 1]) <= budget) {
+      start--;
+      used += optRows(blocks[start]);
+    }
+    let end = start;
+    let fill = 0;
+    while (end < blocks.length && fill + optRows(blocks[end]) <= budget) {
+      fill += optRows(blocks[end]);
+      end++;
+    }
+    if (end <= start) end = Math.min(blocks.length, start + 1);
+    if (start > 0) {
+      lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(`… 上面还有 ${start} 项`), inner)} ${T.dimmer('│')}`);
+    }
+    for (let i = start; i < end; i++) {
+      const b = blocks[i];
+      const sel = i === st.sel;
+      const mark = st.multi ? (st.picked.has(i) ? T.ok('[x]') : T.dimmer('[ ]')) : sel ? T.accent('(●)') : T.dimmer('( )');
+      const rows = [];
+      b.labelLines.forEach((l, li) => {
+        const txt = sel ? T.accentBold(l) : T.white(l);
+        rows.push(li === 0 ? `${mark} ${txt}` : `    ${txt}`);
+      });
+      for (const d of b.descLines) rows.push(`    ${T.dimmer(d)}`);
+      const shown = rows.length > budget ? [...rows.slice(0, Math.max(1, budget - 1)), `    ${T.dimmer('…')}`] : rows;
+      shown.forEach((body, ri) => {
+        if (sel) {
+          const seg = padToWidth(truncToWidth(body, inner + 1), inner + 1);
+          const bullet = ri === 0 ? T.accent('→') : ' ';
+          lines.push(`${T.dimmer('│')}${bg}${bullet}${seg}${reset}${T.dimmer('│')}`);
+        } else {
+          lines.push(`${T.dimmer('│')} ${padToWidth(truncToWidth(body, inner), inner)} ${T.dimmer('│')}`);
+        }
+      });
+    }
+    if (end < blocks.length) {
+      lines.push(`${T.dimmer('│')} ${padToWidth(T.dimmer(`… 下面还有 ${blocks.length - end} 项`), inner)} ${T.dimmer('│')}`);
     }
     lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
     // 自定义输入行：带光标（粘贴一长串后要能看出光标在哪、能在中间接着输），
@@ -1945,11 +2050,17 @@ export class App {
       return this.submit();
     }
     if (k === 'ctrl+j' || k === 'alt+enter') return this.insertText('\n');
-    if (k === 'tab') return this.complete();
+    if (k === 'tab') {
+      const t = this.input.text.trim();
+      if (this.running && t && !t.startsWith('/')) return this.addPending();
+      return this.complete();
+    }
     if (k === 'backspace') return this.deleteBack();
     if (k === 'delete') return this.deleteForward();
     if (k === 'left') return (this.input.cursor = Math.max(0, this.input.cursor - 1));
     if (k === 'right') return (this.input.cursor = Math.min(this.input.text.length, this.input.cursor + 1));
+    if (k === 'ctrl+left' || k === 'alt+b') return this.moveWord(-1);
+    if (k === 'ctrl+right' || k === 'alt+f') return this.moveWord(1);
     if (k === 'home' || k === 'ctrl+a') {
       const before = this.input.text.slice(0, this.input.cursor);
       const nl = before.lastIndexOf('\n');
@@ -1981,15 +2092,14 @@ export class App {
     if (k === 'paste') {
       let text = ev.text.replace(/\r?\n/g, '\n').replace(/\t/g, '  ');
       if (this.running) {
-        // running: treat as steering message, keep it short
-        this.agent.queue(text.trim());
-        this.push({ kind: 'note', text: '已排队，等本轮结束后发送' });
+        // 跑着的时候粘贴只放进输入框：Enter 直接插话，Tab 进待发队列
+        this.insertPasted(text);
+        this.push({ kind: 'note', text: '已粘贴到输入框：Enter 插话，Tab 加入待发队列', inline: true });
         return this.render(true);
       }
-      const long = text.length > 20000;
-      if (long) text = text.slice(0, 20000);
-      this.insertText(text);
-      this.push({ kind: 'note', text: `已粘贴 ${text.length} 字符${long ? '（超长已截断）' : ''}`, inline: true });
+      this.insertPasted(text);
+      const folded = text.length >= 1200;
+      this.push({ kind: 'note', text: folded ? `已粘贴 ${(text.length / 1024).toFixed(1)}KB，折叠成占位符（发送时自动展开）` : `已粘贴 ${text.length} 字符`, inline: true });
       return this.render(true);
     }
     if (k === 'ctrl+v') return this.pasteFromClipboard();
@@ -2125,6 +2235,21 @@ export class App {
     this.dirty = true;
   }
 
+  /** 按词移动光标（Ctrl+←/→、Alt+B/F），排版常用。 */
+  moveWord(dir) {
+    const s = this.input.text;
+    let i = this.input.cursor;
+    if (dir < 0) {
+      while (i > 0 && /\s/.test(s[i - 1])) i--;
+      while (i > 0 && !/\s/.test(s[i - 1])) i--;
+    } else {
+      while (i < s.length && !/\s/.test(s[i])) i++;
+      while (i < s.length && /\s/.test(s[i])) i++;
+    }
+    this.input.cursor = i;
+    this.dirty = true;
+  }
+
   deleteBack() {
     const { text, cursor } = this.input;
     if (!cursor) return;
@@ -2246,21 +2371,25 @@ export class App {
 
   // ------------------------------------------------------------------ submit
   submit() {
-    const text = this.input.text.trim();
+    const raw = this.input.text.trim();
     if (this.prompt) return;
-    if (!text) return;
+    if (!raw) return;
+    const text = this.expandPastes(raw);
     // 整句就是一个 key 的时候拦下来直接存配置：既省得白跑一轮，也避免把密钥发给网关
-    const key = detectApiKey(text);
+    const key = detectApiKey(raw);
     if (key) return this.saveLooseKey(key);
-    this.history.push(text);
+    this.history.push(raw);
     this.histIdx = -1;
     this.input = { text: '', cursor: 0 };
     this.scroll = 0;
     this.followAnchor = null;
-    if (text.startsWith('/')) return this.command(text);
+    if (raw.startsWith('/')) return this.command(text);
     if (this.running) {
+      // 普通发送 = 插话：不等本轮结束，AI 下一步就能看到并调整方向
       this.agent.queue(text);
-      this.push({ kind: 'note', text: `已加入待发送队列（当前步骤结束后处理）：${text.slice(0, 60)}` });
+      this.push({ kind: 'note', text: `已插话（本轮当前步骤结束后生效）：${text.replace(/\s+/g, ' ').slice(0, 60)}`, inline: true });
+      this.dirty = true;
+      this.render(true);
       return;
     }
     this.runTurn(text);
@@ -2372,6 +2501,7 @@ export class App {
         const s = this.agent.engine.stats;
         const lines = [
           `上下文占用  ${T.bold(String(s.tokens))} / ${s.maxTokens} tokens  (${(s.used * 100).toFixed(1)}%)`,
+          `实际发送    ${s.wire} / ${s.budget} tokens${s.wire >= s.budget * 0.8 ? T.warn('（接近压缩线）') : ''}`,
           `活跃消息 ${s.messages}  压缩块 ${s.blocks}  已折叠 ${s.foldedMessages} 条`,
         ];
         for (const n of this.agent.engine.nodes.filter((x) => x.kind === 'block')) {
@@ -2502,13 +2632,75 @@ export class App {
         }
         const hub = await ensureHub(this.config);
         if (!hub) return this.push({ kind: 'warn', text: '团队面板没起来：检查 settings.progress / progressPort（默认 7870）。' });
+        this.bindSpawn(hub);
         if (v === 'open') openInBrowser(hub.url);
         return this.push({
           kind: 'multi',
           lines: [
             `团队面板  ${T.accent(hub.url)}`,
-            T.dim('  浏览器打开这个地址就是团队面板：左边选成员，右边看他这一路的完整对话（含工具输出与思考），还能直接在下面给他传话。'),
+            T.dim('  团队面板：左边选成员，右边看他这一路的完整对话（含工具输出与思考），还能直接在下面给他传话。'),
+            T.dim('  Shell 任务 /shell · 手动开工 /spawn（浏览器里直接组队或派子代理）。'),
             T.dim('  只监听 127.0.0.1，关掉终端就停。输入 /progress open 自动开浏览器。'),
+          ],
+        });
+      }
+      case 'shell': {
+        const hub = await ensureHub(this.config);
+        if (!hub) return this.push({ kind: 'warn', text: '后端没起来：检查 settings.progress / progressPort（默认 7870）。' });
+        this.bindSpawn(hub);
+        const url = hub.url.replace(/\/$/, '') + '/shell';
+        if (String(arg || '').trim().toLowerCase() === 'open') openInBrowser(url);
+        return this.push({
+          kind: 'multi',
+          lines: [
+            `Shell 任务  ${T.accent(url)}`,
+            T.dim('  主代理 / 子代理跑过的每条 shell 都在这里：实时输出、耗时、退出码，可手动终止或清空。'),
+            T.dim('  输入 /shell open 自动开浏览器。'),
+          ],
+        });
+      }
+      case 'spawn': {
+        const hub = await ensureHub(this.config);
+        if (!hub) return this.push({ kind: 'warn', text: '后端没起来：检查 settings.progress / progressPort（默认 7870）。' });
+        this.bindSpawn(hub);
+        const url = hub.url.replace(/\/$/, '') + '/spawn';
+        if (String(arg || '').trim().toLowerCase() === 'open') openInBrowser(url);
+        this.push({
+          kind: 'multi',
+          lines: [
+            `手动开工  ${T.accent(url)}`,
+            T.dim('  浏览器里填目标/成员就能组队，或单独派一个子代理；进度实时回面板与终端。'),
+            T.dim('  输入 /spawn open 自动开浏览器。'),
+          ],
+        });
+        return;
+      }
+      case 'queue': {
+        const v = String(arg || '').trim().toLowerCase();
+        if (v === 'clear') {
+          const n = this.pending.length;
+          this.pending = [];
+          return this.push({ kind: 'note', text: n ? `已清空待发队列（${n} 条）。` : '待发队列本来就是空的。' });
+        }
+        const m = /^drop\s+(\d+)$/.exec(v);
+        if (m) {
+          const i = Number(m[1]) - 1;
+          if (i < 0 || i >= this.pending.length) return this.push({ kind: 'warn', text: `没有第 ${m[1]} 条。` });
+          const [gone] = this.pending.splice(i, 1);
+          return this.push({ kind: 'note', text: `已删除待发：${gone.slice(0, 60)}` });
+        }
+        if (!this.pending.length) {
+          return this.push({
+            kind: 'note',
+            text: this.running ? '待发队列是空的。AI 干活时输入内容，按 Tab 就能附加（最多 5 条）。' : '待发队列是空的。',
+          });
+        }
+        return this.push({
+          kind: 'multi',
+          lines: [
+            `待发队列 ${this.pending.length}/${this.maxPending}${this.running ? T.dim('（AI 收工后自动逐条发送）') : T.dim('（等待发送）')}`,
+            ...this.pending.map((t, i) => `  ${T.accent2(String(i + 1))} ${truncToWidth(t.replace(/\s+/g, ' '), Math.max(20, this.width - 8))}`),
+            T.dim('  /queue drop <n> 删一条 · /queue clear 清空'),
           ],
         });
       }
@@ -2646,6 +2838,28 @@ export class App {
     this.applyModel(item.provider.id, item.model.id);
   }
 
+  /** 流式速度的实时估算（真实值在 usage 事件里校正）。 */
+  tickSpeed() {
+    const secs = (Date.now() - this._gen.t0) / 1000;
+    if (secs < 0.35) return;
+    this.speed = this._gen.tok / secs;
+  }
+
+  /** 大段粘贴折叠成占位符，发送时再展开；输入区保持轻快。 */
+  insertPasted(text) {
+    const s = String(text || '');
+    if (s.length < 1200) return this.insertText(s);
+    // 占位符过长会撑破输入框，这里只保留编号和大小
+    const id = this.pastes.push(s);
+    const kb = (s.length / 1024).toFixed(1);
+    this.insertText(`⟦粘贴#${id}:${kb}KB⟧`);
+    return id;
+  }
+
+  expandPastes(text) {
+    return String(text || '').replace(/⟦粘贴#(\d+):[\d.]+KB⟧/g, (m, id) => this.pastes[Number(id) - 1] ?? m);
+  }
+
   // --------------------------------------------------------------- agent run
   async runTurn(text) {
     this.running = true;
@@ -2655,6 +2869,9 @@ export class App {
     this.toolCount = 0;
     this.taskT0 = Date.now();
     this.lastElapsed = null;
+    this.speed = 0;
+    this.lastSpeed = null;
+    this._gen = { t0: Date.now(), tok: 0 };
     if (!this.title) this.title = text.slice(0, 60);
     // 每给一个新任务，标题就换成新任务（demo 用固定名）
     if (!this.demo) this.taskTitle = compressTitle(text);
@@ -2689,6 +2906,8 @@ export class App {
             const a = ensureAssistant();
             a.text += ev.delta;
             a.ver++;
+            this._gen.tok += estimateTokens(ev.delta);
+            this.tickSpeed();
             this.stateDetail = '输出中';
             break;
           }
@@ -2703,6 +2922,8 @@ export class App {
             }
             think.text += ev.delta;
             think.ver++;
+            this._gen.tok += estimateTokens(ev.delta);
+            this.tickSpeed();
             this.stateDetail = '思考中';
             break;
           }
@@ -2728,7 +2949,7 @@ export class App {
             toolItems.set(ev.id, item);
             this.stateDetail =
               ev.name === 'skill' && String(ev.input?.action || '').toLowerCase() === 'load'
-                ? `技能 ${ev.input.name || ''}`.trim()
+                ? `Call Skill: ${ev.input.name || ''}`.trim()
                 : ev.name;
             break;
           }
@@ -2746,9 +2967,19 @@ export class App {
             }
             break;
           }
+          case 'step': {
+            this._gen = { t0: Date.now(), tok: 0 };
+            break;
+          }
           case 'usage': {
             this.usage = ev.total;
             this.context = ev.context || this.context;
+            // 用真实输出 token 校正速度（这比按字符估准）
+            const secs = (Date.now() - this._gen.t0) / 1000;
+            if (secs > 0.25 && ev.usage?.output > 0) {
+              this.speed = ev.usage.output / secs;
+              this.lastSpeed = this.speed;
+            }
             break;
           }
           case 'compact_start':
@@ -2816,7 +3047,45 @@ export class App {
       }
       this.dirty = true;
       this.saveSession();
+      // 玩家在干活期间附加的消息：本轮收工后自动接着发（最多 5 条，逐条发）
+      this.drainPending();
     }
+  }
+
+  /** 本轮收工后取一条待发消息开新的一轮；返回是否还有得发。 */
+  drainPending() {
+    if (this.running || this.quit || !this.pending.length) return false;
+    const next = this.pending.shift();
+    this.push({
+      kind: 'note',
+      text: `继续处理附加消息（还剩 ${this.pending.length} 条）：${next.slice(0, 60)}`,
+    });
+    this.dirty = true;
+    setTimeout(() => {
+      if (!this.running && !this.quit) this.runTurn(next);
+    }, 40);
+    return true;
+  }
+
+  /** 把输入框里的话附加到待发队列（AI 干活时按 Tab / Enter）。 */
+  addPending(text = null) {
+    const raw = String(text ?? this.input.text ?? '').trim();
+    if (!raw) return;
+    if (this.pending.length >= this.maxPending) {
+      this.push({ kind: 'warn', text: `待发队列最多 ${this.maxPending} 条，先等 AI 处理完，或用 /queue drop <n> 删一条。` });
+      this.dirty = true;
+      return;
+    }
+    const msg = this.expandPastes(raw);
+    this.pending.push(msg);
+    this.input = { text: '', cursor: 0 };
+    this.push({
+      kind: 'note',
+      text: `已附加待发 ${this.pending.length}/${this.maxPending}（本轮收工后自动发送）：${msg.replace(/\s+/g, ' ').slice(0, 60)}`,
+      inline: true,
+    });
+    this.dirty = true;
+    this.render(true);
   }
 
   async manualCompact() {

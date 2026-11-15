@@ -6,6 +6,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { uid, fmtDuration } from '../util.js';
 import { detectShell } from '../config.js';
+import { jobs } from '../jobs.js';
 
 const MAX_OUT = 24 * 1024;
 const DEFAULT_TIMEOUT = 120_000;
@@ -169,7 +170,7 @@ export class ShellSession {
     out = out.replace(/\r\n/g, '\n').replace(/^[\s\S]{0,0}/, '');
     const dur = Date.now() - started;
     const { text, truncated, total } = truncate(out);
-    return { out: text, code: result.code ?? 0, dur, truncated, total, aborted: !!result.aborted };
+    return { out: text, code: result.code ?? 0, dur, truncated, total, aborted: !!result.aborted, timedOut: !!result.timedOut, killed: !!result.dead && !result.aborted && !result.timedOut };
   }
 
   kill() {
@@ -184,6 +185,8 @@ export class ShellSession {
       }
     } catch {}
     this.alive = false;
+    // 外部（浏览器面板）杀掉时，正在等的 waiter 必须立刻收到结果，否则会挂到超时。
+    this._flush(true);
     this.proc = null;
   }
 
@@ -245,17 +248,37 @@ export const shellTool = {
   async execute(input, ctx) {
     if (!input.command) return { isError: true, content: '缺少 command 参数' };
     const shell = getShell(ctx.cwd);
+    const timeout = Math.max(5000, Math.min(600_000, Number(input.timeout) || DEFAULT_TIMEOUT));
+    // 登记到浏览器后端：玩家能看到每条 shell 的命令、实时尾巴、退出码，并能手动终止。
+    const job = jobs.add({
+      command: String(input.command),
+      cwd: shell.cwd || ctx.cwd,
+      source: ctx.depth ? `子代理(层${ctx.depth})` : '主代理',
+      session: ctx.sessionId || '',
+      timeout,
+    });
+    job.kill = () => shell.kill();
     const r = await shell.run(String(input.command), {
-      timeout: Math.max(5000, Math.min(600_000, Number(input.timeout) || DEFAULT_TIMEOUT)),
-      onProgress: ctx.onProgress,
+      timeout,
+      onProgress: (t) => {
+        jobs.progress(job.id, t);
+        ctx.onProgress?.(t);
+      },
       signal: ctx.signal,
     });
-    const head = r.aborted ? '[被用户中断] ' : r.code === 0 ? '' : `[exit ${r.code}] `;
+    jobs.end(job.id, {
+      code: r.code,
+      dur: r.dur,
+      output: r.out,
+      truncated: r.truncated,
+      status: r.aborted ? 'killed' : r.timedOut ? 'timeout' : r.killed ? 'killed' : r.code === 0 ? 'ok' : 'error',
+    });
+    const head = r.aborted || r.killed ? '[被用户中断] ' : r.code === 0 ? '' : `[exit ${r.code}] `;
     const tail = r.truncated ? `\n[输出已截断，共 ${(r.total / 1024).toFixed(1)}KB]` : '';
     return {
-      isError: r.aborted || r.code !== 0,
+      isError: r.aborted || r.killed || r.code !== 0,
       content: `${head}${r.out || '(无输出)'}${tail}`,
-      meta: { kind: 'shell', command: input.command, code: r.code, dur: r.dur, cwd: shell.cwd, truncated: r.truncated },
+      meta: { kind: 'shell', command: input.command, code: r.code, dur: r.dur, cwd: shell.cwd, truncated: r.truncated, jobId: job.id },
     };
   },
 };

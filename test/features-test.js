@@ -520,6 +520,112 @@ await app.render(true);
   check('工具块不是失败态', !/× read/.test(f));
 }
 
+
+// ---- 待发队列：AI 干活时 Tab 附加，最多 5 条，收工后自动发 --------------
+app.running = true;
+app.pending = [];
+app.input = { text: '顺手把测试也补了', cursor: 11 };
+app.handleKey({ key: 'tab' });
+check('Tab 把输入附加到待发队列', app.pending.length === 1 && app.pending[0].includes('顺手把测试'), JSON.stringify(app.pending));
+check('Tab 附然后输入框清空', app.input.text === '');
+app.input = { text: '跑着的时候还能继续写', cursor: 6 };
+app.handleKey({ key: 'tab' });
+check('跑着时可以继续附加第二条', app.pending.length === 2);
+{
+  const queued = [];
+  const origQ = app.agent.queue;
+  app.agent.queue = (t) => queued.push(t);
+  app.input = { text: '先别改那个文件，换个思路', cursor: 14 };
+  app.submit();
+  check('运行中 Enter 是插话而不是排队', queued.length === 1 && queued[0].includes('换个思路'), JSON.stringify(queued));
+  check('插话不占用待发队列', app.pending.length === 2, 'len=' + app.pending.length);
+  check('插话后输入框清空', app.input.text === '');
+  app.agent.queue = origQ;
+}
+for (let i = 0; i < 3; i++) app.addPending('补充' + i);
+check('待发队列上限 5 条', app.pending.length === 5, 'len=' + app.pending.length);
+app.addPending('第六条');
+check('第六条被拒绝', app.pending.length === 5);
+await app.command('/queue drop 2');
+check('/queue drop 删掉指定一条', app.pending.length === 4 && app.pending[1] === '补充0', JSON.stringify(app.pending));
+await app.command('/queue clear');
+check('/queue clear 清空', app.pending.length === 0);
+{
+  app.running = false;
+  app.pending = ['自动一', '自动二'];
+  const sent = [];
+  const orig = app.runTurn;
+  app.runTurn = (t) => { sent.push(t); };
+  const had = app.drainPending();
+  await wait(90);
+  check('收工后自动发第一条', had === true && sent[0] === '自动一', JSON.stringify(sent));
+  check('剩下的一条留在队列里', app.pending.length === 1 && app.pending[0] === '自动二');
+  app.runTurn = orig;
+  app.pending = [];
+}
+
+
+// ---- ask：长选项自动换行 + AI 推荐标记 -----------------------------------
+{
+  let got = null;
+  const r = await runTool(
+    {
+      id: 'x2',
+      name: 'ask',
+      input: {
+        question: '选哪个？',
+        options: [
+          { label: '甲方案', desc: '快但糙', recommended: true },
+          { label: '乙方案', desc: '慢但稳' },
+        ],
+      },
+    },
+    { cwd: WS, ask: async (p) => { got = p; return { answer: '甲方案' }; } },
+  );
+  check('ask 把 recommended 传给界面', got?.options?.[0]?.recommended === true && !got?.options?.[1]?.recommended);
+  check('ask 推荐项照常返回答案', /甲方案/.test(r.content), r.content);
+}
+{
+  const longLabel = '把整个前端渲染层重构成增量更新并且保持所有现有快捷键和鼠标选择行为完全不变再加一点调试日志方便排查';
+  const longDesc = '这样做的好处是长对话下更省 CPU，但改动面比较大，需要补一轮完整的界面回归测试之后才能合入主线分支。';
+  app.items = [];
+  app.running = false;
+  app.askState = {
+    question: '要按哪种方式改？',
+    options: [
+      { label: longLabel, desc: longDesc, recommended: true },
+      { label: '只改一小块，先验证效果', desc: '', recommended: false },
+    ],
+    multi: false,
+    def: '',
+    sel: 0,
+    picked: new Set(),
+    other: '',
+    cur: 0,
+    resolve: () => {},
+  };
+  await app.render(true);
+  const f2 = snap();
+  check('ask 长选项自动换行（尾部不丢）', f2.includes('方便排查'), f2.split('\n').filter((l) => /排查|重构成/.test(l)).join(' | '));
+  check('ask 长说明也换行显示', f2.includes('合入主线') || f2.includes('回归测试'));
+  check('ask 推荐项标出（推荐）', f2.includes('（推荐）'));
+  check('ask 选项行不再用省略号截断正文', !/重构成.*…/.test(f2));
+
+  // 选项多到一屏放不下：窗口跟着选中项滚动，最后一项仍可见
+  app.askState.options = Array.from({ length: 9 }, (_, i) => ({
+    label: `第${i + 1}项：这是一个长度中等但确实会占掉一些宽度的选项说明文字`,
+    desc: '补充说明一行，帮助玩家理解这个选项的具体影响。',
+    recommended: i === 8,
+  }));
+  app.askState.sel = 8;
+  await app.render(true);
+  const f3 = snap();
+  check('ask 多选项时选中项始终可见', f3.includes('第9项') && f3.includes('（推荐）'));
+  check('ask 多选项时提示上方还有内容', /上面还有/.test(f3));
+  app.askState = null;
+  await app.render(true);
+}
+
 app.quit = true;
 clearInterval(app.timer);
 log('');

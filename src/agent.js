@@ -3,7 +3,7 @@ import { streamChat, LLMError, estimateCost } from './llm.js';
 import { ContextEngine, flattenNodes } from './context/engine.js';
 import { toolSchemas, planBatches, runTool, allTools, enabledTools } from './tools/index.js';
 import { getProvider, resolveModel } from './providers.js';
-import { memoryPrompt, projectMemory } from './tools/todo.js';
+import { memoryPrompt, projectMemory, readTodo, formatTodo } from './tools/todo.js';
 import { skillsPrompt } from './tools/skill.js';
 import { describeHooks } from './tools/hooks.js';
 import { describeShell } from './tools/shell.js';
@@ -30,6 +30,7 @@ export class Agent {
     this.usageTotal = { input: 0, output: 0, cacheRead: 0, cost: 0, steps: 0 };
     const target = this.target();
     this.engine = new ContextEngine({ maxTokens: target.model?.ctx || 128000, compactAt: config.settings.compactAt });
+    this.applyEngineLimits(target);
     this.lastError = null;
     this.busy = false;
     // 交互提问回调：由宿主（TUI / --plain）注入，ask 工具靠它等玩家回答。
@@ -60,8 +61,19 @@ export class Agent {
   setActive(providerId, modelId) {
     this.config.setActive(providerId, modelId);
     const t = this.target();
-    this.engine.maxTokens = t.model?.ctx || 128000;
+    this.applyEngineLimits(t);
     return t;
+  }
+
+  /** 把窗口 / 压缩阈值 / 输出预留同步给上下文引擎。 */
+  applyEngineLimits(t = this.target()) {
+    const ctx = t.model?.ctx || 128000;
+    this.engine.maxTokens = ctx;
+    this.engine.compactAt = this.config.settings.compactAt;
+    const out = Number(this.config.settings.maxTokens) || 0;
+    // 输出预留：最多 20% 窗口，且不超过玩家配置的单次输出上限；至少 4k。
+    // 这样输入永远不会把窗口塞死，模型总有地方把话说完。
+    this.engine.reserveTokens = Math.min(out || 0, Math.max(4096, Math.floor(ctx * 0.2)));
   }
 
   queue(text) {
@@ -78,6 +90,7 @@ export class Agent {
       maxTokens: this.target().model?.ctx || 128000,
       compactAt: this.config.settings.compactAt,
     });
+    this.applyEngineLimits();
   }
 
   systemPrompt() {
@@ -101,6 +114,16 @@ ${mem}` : '', proj ? `
 ${proj}` : '', skills ? `
 
 # ${skills}` : ''].join('') + hookBlock;
+    // 工作记忆：待办 + 会话脉络。长对话被压缩后，模型靠这块不至于“忘掉前面”。
+    const todo = readTodo(this.cwd);
+    const todoText = todo.items.length ? formatTodo(todo) : '';
+    const brief = this.engine.brief();
+    const workBlock = todoText || brief
+      ? `
+
+# 工作记忆（系统自动维护，长对话防遗忘）
+${todoText ? `## 当前待办（用 todo 工具更新）\n${todoText}\n` : ''}${brief ? `## 会话脉络（最近的请求与压缩块）\n${brief}\n` : ''}旧细节被压缩后，先用 context 工具 search，再 expand；不要凭印象编造。`
+      : '';
     const st = this.config.settings || {};
     const caps = [];
     if (st.subagents) caps.push('subagent');
@@ -163,7 +186,9 @@ ${proj}` : '', skills ? `
 - 简洁、直接、可执行。
 - 不用空洞开场与总结套话；不重复用户已知的信息。
 - 代码引用写成 \`path/file.js:12\`。改动后简短说明改了什么、验证了什么。
-- 结尾可以给一句“下一步建议”，但不要长篇罗列。${memoryBlock}${subagentBlock}`;
+- 结尾可以给一句“下一步建议”，但不要长篇罗列。
+- 先给结论/正在做什么（一两句），再给细节；中途不要重复已经说过的内容。
+- 长任务每完成一步就用 todo update 标记；发现新的长期偏好/约束立刻 memory set，不要等玩家提醒。${memoryBlock}${workBlock}${subagentBlock}`;
   }
 
   ctx() {
@@ -200,8 +225,7 @@ ${proj}` : '', skills ? `
   async *run(text, { signal } = {}) {
     const settings = this.config.settings;
     const t0 = this.target();
-    this.engine.maxTokens = t0.model?.ctx || 128000;
-    this.engine.compactAt = settings.compactAt;
+    this.applyEngineLimits(t0);
     this.engine.addUser(text);
     this.busy = true;
     const controller = new AbortController();
@@ -211,6 +235,7 @@ ${proj}` : '', skills ? `
 
     try {
       let cont = 0; // 输出被长度上限截断时的自动续写次数
+      let ctxRetries = 0; // 服务端报“上下文超长”时强制压缩重试的次数
       // maxSteps <= 0 / 未设置 / 非法值 => 不限步数（只在用户显式配了正数时才限制）
       const maxStepLimit = Number(settings.maxSteps);
       const stepLimit = Number.isFinite(maxStepLimit) && maxStepLimit > 0 ? Math.floor(maxStepLimit) : 0;
@@ -220,7 +245,7 @@ ${proj}` : '', skills ? `
           return;
         }
         if (this.engine.needsCompact()) {
-          yield* this.compactInline(controller.signal);
+          yield* this.compactUntil(controller.signal);
         }
         const t = this.target();
         if (!this.config.hasKey(t.providerId)) {
@@ -281,6 +306,14 @@ ${proj}` : '', skills ? `
             if (e.name === 'AbortError' || controller.signal.aborted) {
               yield { type: 'aborted' };
               return;
+            }
+            // 服务端说“上下文太长/超过窗口”：不是普通错误，压缩后重来，别直接停下。
+            if (ctxRetries < 2 && isContextOverflow(e)) {
+              ctxRetries++;
+              yield { type: 'retry', attempt, wait: 0, message: '上下文超出模型窗口，正在强制压缩历史后重试…', context_overflow: true };
+              yield* this.compactUntil(controller.signal, { force: true });
+              attempt = Math.max(1, attempt - 1); // 这次不算普通失败次数
+              continue;
             }
             const retryable = e instanceof LLMError ? e.retryable : true;
             if (!retryable || attempt === MAX_RETRIES) break;
@@ -371,9 +404,9 @@ ${proj}` : '', skills ? `
   }
 
   /** Fold the oldest slice of history; model-written summary when possible. */
-  async *compactInline(signal) {
-    const plan = this.engine.planFold();
-    if (!plan) return;
+  async *compactInline(signal, { tail = null } = {}) {
+    const plan = tail == null ? this.engine.planFold() : this.engine.planFold({ tail });
+    if (!plan) return false;
     yield { type: 'compact_start', nodes: plan.nodes.length, tokens: plan.tokens };
     let summary = null;
     try {
@@ -384,6 +417,36 @@ ${proj}` : '', skills ? `
     const topic = guessTopic(plan.nodes);
     const block = this.engine.fold(plan.start, plan.end, summary || this.engine.mechanicalSummary(plan.nodes), topic);
     yield { type: 'compact_end', block: block.id, topic, summary: block.summary, context: this.engine.stats };
+    return true;
+  }
+
+  /**
+   * 一次把上下文压到阈值以下：正常从 tail=8 开始，不够就折得更狠（4/2/1）。
+   * force=true 时不看 needsCompact（服务端已经报超长），必须动手。
+   */
+  async *compactUntil(signal, { force = false } = {}) {
+    const tails = [this.engine.tail, 4, 2, 1];
+    let did = false;
+    for (const tail of tails) {
+      for (let guard = 0; guard < 4; guard++) {
+        if (!force && !this.engine.needsCompact()) return;
+        const before = this.engine.wireTokens();
+        const ok = yield* this.compactInline(signal, { tail });
+        if (!ok) break;
+        did = true;
+        force = false;
+        if (this.engine.wireTokens() >= before) break; // 没缩小就换更狠的策略
+      }
+    }
+    if (this.engine.critical()) {
+      // 最后一道保险：老图片最贵，只留最近两张；再不行渲染层会压缩工具输出。
+      const dropped = this.engine.trimImages(2);
+      if (dropped) yield { type: 'note', text: `上下文仍偏紧，已省略 ${dropped} 张旧图片（需要时可重新 read）` };
+    }
+    if (!did && force) {
+      // 已经没有可折的中间段了：至少把渲染预算压到最低，避免硬撞服务端上限。
+      this.engine.toolResultBudget = 1400;
+    }
   }
 
   async summarize(nodes, signal) {
@@ -437,4 +500,13 @@ function guessTopic(nodes) {
   if (!users.length) return '历史片段';
   const last = users[users.length - 1].replace(/\s+/g, ' ').trim();
   return last.length > 40 ? last.slice(0, 40) + '…' : last;
+}
+
+/** 服务端的“上下文超长”类错误：这类错误要用压缩解决，而不是重试等待。 */
+export function isContextOverflow(e) {
+  if (!e) return false;
+  const s = `${e.message || ''} ${e.body || ''} ${e.code || ''}`.toLowerCase();
+  if (/context[_ ]length|maximum context|context window|prompt is too long|too many tokens|reduce the length|token limit|input is too long/.test(s)) return true;
+  // 有些兼容层只返回 400 + “tokens”，且能确定是输入过长
+  return (e.status === 400 || e.status === 413) && /(token|context|length|too long|exceed)/.test(s);
 }

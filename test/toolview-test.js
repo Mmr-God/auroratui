@@ -96,7 +96,13 @@ check(
 check('compress 展开注脚提到区间', /m00100-m00160/.test(vCompress.note), vCompress.note);
 
 const vSkill = describeTool(item('skill', { action: 'load', name: 'godot-ai' }, sk));
-check('skill 封装：标签=技能名', vSkill.label === 'godot-ai' && vSkill.tags[0].t === '技能' && vSkill.summary === 'Godot 4.x 游戏开发流程', JSON.stringify(vSkill));
+check(
+  'skill 封装：标题 = Call Skill: 技能名',
+  vSkill.label === 'Call Skill: godot-ai' && !vSkill.tags.some((t) => t.t === '技能') && vSkill.summary === 'Godot 4.x 游戏开发流程',
+  JSON.stringify(vSkill),
+);
+const vSkillList = describeTool({ kind: 'tool', name: 'skill', input: { action: 'list' }, content: '- a' });
+check('skill list 保持标签「技能」且不带 Call Skill 前缀', vSkillList.label === 'skill' && vSkillList.tags.some((t) => t.t === '技能'), JSON.stringify(vSkillList));
 check('skill 展开注脚提到行数', /行/.test(vSkill.note), vSkill.note);
 
 const vTodo = describeTool(item('todo', { action: 'set' }, td));
@@ -158,7 +164,7 @@ check('失败态用 × 且保留标签', errLines[0].includes('×') && errLines[
 
 // 运行中：spinner + 标签（此时还没有 meta，靠 input 兜住）
 const runLines = render({ name: 'skill', input: { action: 'load', name: 'godot-ai' }, status: 'running', content: '', meta: undefined });
-check('运行中显示技能名', runLines[0].includes('godot-ai') && runLines[0].includes('技能'), JSON.stringify(runLines[0]));
+check('运行中显示 Call Skill: 技能名', runLines[0].includes('Call Skill: godot-ai'), JSON.stringify(runLines[0]));
 
 // draw 画板：标题带画板名、尺寸、这轮画了几笔；[图片] 徽章说明模型看见了
 const drawMeta = { kind: 'image', board: 'slime', size: '32x32', applied: 5, scale: 8, bytes: 1024, images: [{ mime: 'image/png', width: 256, height: 256 }], summary: 'slime 32x32 · 5 op' };

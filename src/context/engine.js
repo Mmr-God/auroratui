@@ -11,6 +11,7 @@ import { estimateTokens } from '../util.js';
 
 const KEEP_HEAD = 2; // system-side anchor + first user message
 const KEEP_TAIL = 8; // recent turns kept verbatim
+const MIN_TOOL_BUDGET = 700; // 再挤也要给工具结果留一点内容
 
 export class ContextEngine {
   constructor({ maxTokens = 128000, compactAt = 0.72, head = KEEP_HEAD, tail = KEEP_TAIL } = {}) {
@@ -23,6 +24,15 @@ export class ContextEngine {
     this.mseq = 0;
     this.bseq = 0;
     this.toolResultBudget = 4200; // chars of a tool result sent to the model
+    // 给模型这次输出预留的空间：预算 = 窗口 - 预留，避免“输入刚好塞满 → 没有位置输出”
+    this.reserveTokens = 0;
+    // 真正请求前如果仍然超了，渲染层会逐级压缩工具输出（最后一道保险）
+    this.hardCapAt = 0.94;
+  }
+
+  /** 可用于输入的有效窗口（扣掉输出预留）。 */
+  get budget() {
+    return Math.max(2000, this.maxTokens - Math.max(0, this.reserveTokens || 0));
   }
 
   // ---------------------------------------------------------------- writing
@@ -58,10 +68,39 @@ export class ContextEngine {
       blocks: blocks.length,
       tokens,
       maxTokens: this.maxTokens,
+      budget: this.budget,
+      wire: this.wireTokens(this.toolResultBudget),
       used: tokens / this.maxTokens,
       foldedMessages: blocks.reduce((a, b) => a + (b.count || 0), 0),
       storedOriginal: [...this.folded.values()].reduce((a, f) => a + f.nodes.length, 0),
     };
+  }
+
+  /**
+   * 真正发出去的内容大约多少 token。tokens() 统计的是完整存储内容，
+   * 而 render() 会截断老工具结果；压缩判断必须按“发出去的”算，否则会误判。
+   */
+  wireTokens(toolBudget = this.toolResultBudget) {
+    let t = 0;
+    for (const n of this.nodes) {
+      if (n.kind === 'block') {
+        t += estimateTokens(n.summary || '') + 12;
+        continue;
+      }
+      const m = n.message;
+      if (m.role === 'tool') {
+        const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+        const used = Math.min(text.length, toolBudget) + (text.length > toolBudget ? 40 : 0);
+        t += estimateTokens('x'.repeat(used)) + 6;
+        if (m.images?.length) t += 1100 * m.images.length;
+      } else {
+        t += estimateTokens(typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')) + 6;
+        if (m.reasoning) t += estimateTokens(m.reasoning);
+        if (m.toolCalls) t += estimateTokens(JSON.stringify(m.toolCalls));
+        if (m.images?.length) t += 1100 * m.images.length;
+      }
+    }
+    return t;
   }
 
   tokens(nodes = this.nodes) {
@@ -80,12 +119,28 @@ export class ContextEngine {
     return t;
   }
 
-  needsCompact() {
-    return this.tokens() > this.maxTokens * this.compactAt;
+  /** extra：马上要追加的输入（比如一条新用户消息）估算 token。 */
+  needsCompact(extra = 0) {
+    return this.wireTokens(this.toolResultBudget) + extra > this.budget * this.compactAt;
+  }
+
+  /** 已经挤到硬上限（再发就可能被服务端拒绝）。 */
+  critical() {
+    return this.wireTokens(MIN_TOOL_BUDGET) > this.budget * this.hardCapAt;
+  }
+
+  /** 渲染前自适应的工具结果预算：越接近上限，老工具输出保留得越少。 */
+  adaptiveToolBudget() {
+    let b = this.toolResultBudget;
+    for (let i = 0; i < 5 && this.wireTokens(b) > this.budget * this.compactAt; i++) {
+      b = Math.max(MIN_TOOL_BUDGET, Math.floor(b * 0.55));
+    }
+    return b;
   }
 
   // -------------------------------------------------------------- rendering
-  render({ toolBudget = this.toolResultBudget } = {}) {
+  render({ toolBudget = null } = {}) {
+    const budget = toolBudget == null ? this.adaptiveToolBudget() : toolBudget;
     const out = [];
     for (const n of this.nodes) {
       if (n.kind === 'block') {
@@ -100,7 +155,7 @@ export class ContextEngine {
       const m = n.message;
       if (m.role === 'tool') {
         const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-        const cut = text.length > toolBudget ? text.slice(0, toolBudget) + `\n…(已省略 ${text.length - toolBudget} 字符，引用 ${n.id})` : text;
+        const cut = text.length > budget ? text.slice(0, budget) + `\n…(已省略 ${text.length - budget} 字符，引用 ${n.id}；需要时用 context expand 取回)` : text;
         out.push({
           role: 'tool',
           toolCallId: m.toolCallId,
@@ -125,24 +180,72 @@ export class ContextEngine {
   }
 
   // ------------------------------------------------------- fold planning
-  /** Candidate contiguous range of middle nodes worth folding, or null. */
-  planFold() {
+  /**
+   * Candidate contiguous range of middle nodes worth folding, or null.
+   * tail 越小折得越狠（上下文吃紧时 agent 会依次用 8 → 4 → 2 → 1）。
+   */
+  planFold({ tail = this.tail, minNodes = 3 } = {}) {
     const live = this.nodes;
-    if (live.length < this.head + this.tail + 4) return null;
+    if (live.length < this.head + 1 + Math.max(1, tail)) return null;
     let start = this.head;
-    let end = live.length - this.tail; // exclusive
-    // never start on a tool result (its assistant call must come along)
+    let end = Math.max(start, live.length - Math.max(1, tail)); // exclusive
+    // 起点不能落在工具结果上：它的 assistant 调用必须一起带走
     while (start < end && live[start].kind === 'message' && live[start].message.role === 'tool') start++;
-    // never split a tool pair: don't end right after an assistant w/ toolCalls
-    while (end > start) {
+    // 终点不能把 assistant(tool_calls) 和它的 tool 结果拆开：宁可多留几条
+    while (end > start && end < live.length) {
       const prev = live[end - 1];
-      if (prev.kind === 'message' && prev.message.role === 'assistant' && prev.message.toolCalls?.length) end--;
+      const next = live[end];
+      const prevCalls = prev?.kind === 'message' && prev.message.role === 'assistant' && prev.message.toolCalls?.length;
+      const nextIsTool = next?.kind === 'message' && next.message.role === 'tool';
+      if (prevCalls || nextIsTool) end++;
       else break;
     }
-    if (end - start < 3) return null;
-    // shrink target so compaction is meaningful (aim ~40% of budget)
+    // 起点后如果紧跟着 tool 结果（assistant 被切在 start 之外），把 assistant 拉回来
+    if (start > this.head) {
+      const prev = live[start - 1];
+      const prevCalls = prev?.kind === 'message' && prev.message.role === 'assistant' && prev.message.toolCalls?.length;
+      const curIsTool = live[start]?.kind === 'message' && live[start].message.role === 'tool';
+      if (prevCalls && curIsTool) start--;
+    }
+    if (end - start < minNodes) return null;
     const slice = live.slice(start, end);
     return { start, end, nodes: slice, tokens: this.tokens(slice) };
+  }
+
+  /**
+   * 应急：老图片只留最近 keep 张。图片每张按 ~1100 token 算，是最贵的历史。
+   * 返回省下的图片张数（0 表示没动）。
+   */
+  trimImages(keep = 2) {
+    let seen = 0;
+    let dropped = 0;
+    for (let i = this.nodes.length - 1; i >= 0; i--) {
+      const n = this.nodes[i];
+      if (n.kind !== 'message' || !n.message.images?.length) continue;
+      if (seen < keep) {
+        seen += n.message.images.length;
+        continue;
+      }
+      dropped += n.message.images.length;
+      n.message.images = undefined;
+    }
+    return dropped;
+  }
+
+  /** 最近的用户请求 + 压缩块主题，用于给模型一份“会话脉络”防遗忘。 */
+  brief({ maxChars = 2600 } = {}) {
+    const users = [];
+    for (const n of this.nodes) {
+      if (n.kind === 'message' && n.message.role === 'user') users.push(String(n.message.content || ''));
+    }
+    const blocks = this.nodes.filter((n) => n.kind === 'block');
+    const lines = [];
+    for (const b of blocks.slice(-4)) lines.push(`- [${b.id} ${b.from}-${b.to}] ${b.topic || '历史'}：${firstLineOf(b.summary)}`);
+    for (const u of users.slice(-4)) lines.push(`- 用户：${clip(u, 200)}`);
+    if (!lines.length) return '';
+    let text = lines.join('\n');
+    if (text.length > maxChars) text = text.slice(0, maxChars) + '…';
+    return text;
   }
 
   /** Fold nodes[start,end) into a block with the supplied summary text. */

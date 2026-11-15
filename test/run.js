@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const live = process.argv.includes('--live');
-const suites = ['loop-test.js', 'tools-test.js', 'ui-sim.js', 'paste-test.js', 'askpaste-test.js', 'layout-test.js', 'toolview-test.js', 'features-test.js', 'collab-test.js', 'image-test.js', 'draw-test.js', 'highlight-test.js'];
+const suites = ['loop-test.js', 'tools-test.js', 'ui-sim.js', 'paste-test.js', 'askpaste-test.js', 'layout-test.js', 'toolview-test.js', 'features-test.js', 'backend-test.js', 'collab-test.js', 'image-test.js', 'draw-test.js', 'highlight-test.js'];
 if (live) suites.push('live-test.mjs');
 
 let failed = 0;

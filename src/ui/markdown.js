@@ -39,7 +39,9 @@ function renderCodeBlock(lang, body, width, opts = {}) {
   const label = id || String(lang || '').trim().toLowerCase() || 'text';
   const total = body.length;
   const maxLines = opts.maxLines ?? 40;
-  const rows = total > maxLines ? body.slice(0, maxLines) : body;
+  // 流式输出时保留最后几行（正在写的那段），否则新代码会被挡在折叠线外；
+  // 写完后再从头展示。超长代码块始终折叠，避免一屏全是代码。
+  const rows = total > maxLines ? (opts.streaming ? body.slice(-maxLines) : body.slice(0, maxLines)) : body;
   const hidden = total - rows.length;
 
   const headPrefix = `  ${T.dimmer('╭─')} ${T.accent2(label)} ${T.dimmer('·')} ${T.dimmer(`${total} 行`)} `;
@@ -56,7 +58,8 @@ function renderCodeBlock(lang, body, width, opts = {}) {
     for (const line of wrapped) out.push(`  ${T.dimmer('│')} ${line}`);
   }
   if (hidden > 0) {
-    out.push(`  ${T.dimmer('│')} ${T.dimmer(`… 还有 ${hidden} 行 · 点开完整查看`)}`);
+    const where = opts.streaming ? `前面还有 ${hidden} 行（写完后展开）` : `还有 ${hidden} 行 · 点开完整查看`;
+    out.push(`  ${T.dimmer('│')} ${T.dimmer(`… ${where}`)}`);
   }
   out.push('  ' + T.dimmer('╰' + '─'.repeat(Math.max(4, avail - 2)) + '╯'));
   return out;
