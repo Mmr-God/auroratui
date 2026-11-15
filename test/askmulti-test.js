@@ -5,6 +5,7 @@
 //  4) 一项没勾就提交 → 不关弹层，给提示
 //  5) 单选模式：回车/点击仍然是选定即提交（回归）
 //  6) 滚轮 = 上下挪高亮，右键仍然是粘贴
+//  7) 选好后按 Tab（Caps 上面那个键）= 确定：多选交回全部勾选项，单选交回高亮项
 import { PassThrough } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -193,6 +194,39 @@ await wait(150);
   key('\r');
   await wait(60);
   check('多选：手打答案后回车直接提交', !app.askState);
+}
+
+// ---------------------------------------- 7) 选好后 Tab = 确定
+{
+  const got = openAsk({ multi: true });
+  await wait(20);
+  key('\r'); // 勾第一项
+  await wait(30);
+  key('\x1b[B\r'); // ↓ + 勾第二项
+  await wait(60);
+  check('多选：Tab 之前弹层还在（两顶已勾）', !!app.askState && app.askState.picked.size === 2, JSON.stringify([...(app.askState?.picked || [])]));
+  key('\t'); // Tab
+  await wait(80);
+  check('多选：Tab 直接确定并关窗', !app.askState);
+  check('多选：Tab 交回全部勾选项', JSON.stringify(got.value?.selections) === JSON.stringify(['甲', '乙']), JSON.stringify(got.value));
+
+  // 一项没勾就 Tab：不关窗，提醒先勾选
+  const got2 = openAsk({ multi: true });
+  await wait(20);
+  key('\t');
+  await wait(60);
+  check('多选：一项没勾 Tab 不关窗', !!app.askState && got2.value === undefined);
+  app.finishAsk(null);
+  await wait(30);
+
+  // 单选：Tab 也确定（提交高亮项）
+  const got3 = openAsk();
+  await wait(20);
+  key('\x1b[B'); // ↓
+  await wait(40);
+  key('\t');
+  await wait(60);
+  check('单选：Tab 确定提交高亮项', got3.value?.answer === '乙', JSON.stringify(got3.value));
 }
 
 log(failed ? `\n${failed} 项失败` : '\n全部通过');

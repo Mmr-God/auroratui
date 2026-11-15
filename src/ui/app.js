@@ -1687,7 +1687,7 @@ export class App {
     if (st.multi) {
       // 一项都没勾就提交 = 什么都答不上来：留在弹层里提示，别默默关掉
       if (!st.picked.size) {
-        st.notice = '还没勾选任何一项：空格 / Enter / 鼠标点击 勾选，再回车「完成」';
+        st.notice = '还没勾选任何一项：空格 / Enter / 鼠标点击 勾选，选好后按 Tab 确定';
         return;
       }
       const labels = st.options.filter((_, i) => st.picked.has(i)).map((o) => o.label);
@@ -1715,13 +1715,15 @@ export class App {
       st.sel = (st.sel - 1 + n) % n;
       return;
     }
-    if (k === 'down' || k === 'tab') {
+    if (k === 'down') {
       st.sel = (st.sel + 1) % n;
       return;
     }
+    // 选好后按 Tab（Caps 上面那个键）直接确定：多选提交全部勾选项，单选提交高亮项
+    if (k === 'tab') return this.submitAsk();
     if (k === 'enter') {
       // 多选：回车 = 勾选/取消光标所在的项。之前回车直接就把高亮项发出去了，
-      // 玩家根本来不及多选；要提交就走到最后一行「完成」回车（手打了答案也直接提交）。
+      // 玩家根本来不及多选；要提交就按 Tab，或者走到最后一行「完成」回车（手打了答案也直接提交）。
       if (st.multi && st.sel !== confirmRow && !st.other.trim()) {
         return this.togglePick(st.sel);
       }
@@ -1911,8 +1913,8 @@ export class App {
     const inner = boxW - 4;
     const lines = [];
     const hint = st.multi
-      ? '可多选：空格 / Enter / 点击鼠标 勾选，选完 ↓ 到「完成」回车提交 · Ctrl+V/右键粘贴 · ESC 跳过'
-      : '单选：↑↓ / 数字 / 点击 选择，也可以直接打字 · Ctrl+V/右键粘贴 · ESC 跳过';
+      ? '可多选：空格/Enter/点击 勾选；选好后 Tab 确定 · Ctrl+V/右键粘贴 · ESC 跳过'
+      : '单选：↑↓/数字/点击 选择，Tab 确定 · Ctrl+V/右键粘贴 · ESC 跳过';
     const title = ` ${T.accentBold('AI 需要确认')} `;
     const titleW = strWidth(stripAnsi(title));
     lines.push(T.dimmer('╭─') + title + T.dimmer('─'.repeat(Math.max(0, boxW - 4 - titleW)) + '╮'));
@@ -2002,8 +2004,8 @@ export class App {
     if (st.multi) {
       const active = st.sel >= st.options.length;
       const label = st.picked.size
-        ? `完成选择（已选 ${st.picked.size} 项，回车提交）`
-        : '完成选择（先勾选，再回车提交）';
+        ? `完成选择（已选 ${st.picked.size} 项，回车/Tab 提交）`
+        : '完成选择（先勾选，再回车/Tab 提交）';
       const body = `${T.ok('[✓]')} ${active ? T.accentBold(label) : T.white(label)}`;
       confirmLine = lines.length;
       if (active) {
