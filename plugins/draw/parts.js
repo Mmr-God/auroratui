@@ -144,6 +144,8 @@ export const PARTS = [
     hint: "默认圆眼（白底+瞳孔+高光）；variant: dot/round/sleepy/angry/closed/wink/sparkle，size 决定眼睛整体宽度",
     variants: ["round", "dot", "sleepy", "angry", "closed", "wink", "sparkle"],
     sym: true,
+    // 不传 x/y 时：水平居中，纵向落在主体 42% 高度（脸的位置）
+    auto: { ax: 0.5, ay: 0.42 },
     draw(c, p, v) {
       const cx = 0.27;
       const cy = 0.5;
@@ -189,6 +191,7 @@ export const PARTS = [
     hint: "variant: smile/cat/open/grin；cat 是 ω 猫嘴，open 带口腔",
     variants: ["smile", "cat", "open", "grin"],
     sym: true,
+    auto: { ax: 0.5, ay: 0.68 },
     draw(c, p, v) {
       const cx = 0.5;
       const cy = 0.5;
@@ -219,6 +222,7 @@ export const PARTS = [
     hint: "两团半透明粉色腮红，常配 eyes 一起用",
     palette: { main: "#f08fa8", accent: "#f08fa8" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.56 },
     draw(c, p) {
       ell(c, 0.27, 0.5, 0.15, 0.1, p.accent || "#f08fa8", 150);
     },
@@ -229,6 +233,7 @@ export const PARTS = [
     hint: "小三角鼻（猫/狗），默认粉色",
     palette: { main: "#f08fa8", accent: "#f08fa8" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.56 },
     draw(c, p) {
       poly(c, [[0.4, 0.4], [0.6, 0.4], [0.5, 0.62]], p.accent || "#f08fa8");
     },
@@ -239,6 +244,7 @@ export const PARTS = [
     hint: "从嘴角露出的两颗小牙（默认白色，可 color 改）",
     palette: { main: "#ffffff", accent: "#ffffff" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.72 },
     draw(c, p) {
       poly(c, [[0.26, 0.16], [0.46, 0.16], [0.36, 0.86]], p.white);
     },
@@ -250,6 +256,8 @@ export const PARTS = [
     variants: ["cat", "bear", "fox"],
     palette: { main: "#e8a33d", accent: "#f0a6b4" },
     sym: true,
+    // 耳朵画在部件画布的底部，所以「底边贴主体顶」而不是用纵向比例
+    auto: { ax: 0.5, ay: 0.16, hang: "bottom" },
     draw(c, p, v) {
       if (v === "bear") {
         ell(c, 0.26, 0.42, 0.24, 0.24, p.main);
@@ -270,6 +278,7 @@ export const PARTS = [
     variants: ["pair", "single"],
     palette: { main: "#e8e0cf", accent: "#e8e0cf" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.14 },
     draw(c, p, v) {
       if (v === "single") {
         poly(c, [[0.34, 0.95], [0.5, 0.06], [0.66, 0.95]], p.accent || "#e8e0cf");
@@ -285,6 +294,7 @@ export const PARTS = [
     variants: ["feather", "bat", "small"],
     palette: { main: "#f4f7fb", accent: "#8fa4c0" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.45 },
     draw(c, p, v) {
       if (v === "bat") {
         poly(c, [[0.5, 0.42], [0.04, 0.2], [0.12, 0.62], [0.26, 0.5], [0.3, 0.85], [0.5, 0.68]], p.main);
@@ -309,6 +319,7 @@ export const PARTS = [
     hint: "三尖皇冠，默认金色，带宝石",
     palette: { main: "#f0b429", accent: "#c98a17" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.02, hang: "bottom" },
     draw(c, p) {
       const gold = p.main || "#f0b429";
       poly(c, [[0.06, 0.86], [0.06, 0.3], [0.26, 0.56], [0.5, 0.16], [0.74, 0.56], [0.94, 0.3], [0.94, 0.86]], gold);
@@ -323,6 +334,7 @@ export const PARTS = [
     variants: ["wizard", "straw", "top"],
     palette: { main: "#4f5bd5", accent: "#3a44a8" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.02, hang: "bottom" },
     draw(c, p, v) {
       const main = p.main || "#4f5bd5";
       if (v === "straw") {
@@ -348,6 +360,7 @@ export const PARTS = [
     hint: "向右上翘的尾巴（不对称），flip:true 可翻到左边",
     palette: { main: "#e8a33d", accent: "#c9842c" },
     sym: false,
+    auto: { ax: 0.78, ay: 0.62 },
     draw(c, p) {
       arc(c, 0.36, 0.5, 0.3, 0.32, -110, 30, p.main, 255, 0.22);
       ell(c, 0.62, 0.28, 0.1, 0.1, p.accent || p.main);
@@ -359,6 +372,7 @@ export const PARTS = [
     hint: "半透明椭圆投影，垫在脚下让人物站稳",
     palette: { main: "#000000", accent: "#000000" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.94 },
     draw(c) {
       ell(c, 0.5, 0.62, 0.5, 0.26, "#000000", 70);
       ell(c, 0.5, 0.6, 0.32, 0.15, "#000000", 55);
@@ -370,6 +384,7 @@ export const PARTS = [
     hint: "斜向白色高光条，给球体/宝石/金属加体积感",
     palette: { main: "#ffffff", accent: "#ffffff" },
     sym: false,
+    auto: { ax: 0.42, ay: 0.28 },
     draw(c, p) {
       seg(c, 0.2, 0.44, 0.52, 0.16, p.white, 190, 0.8);
       seg(c, 0.44, 0.5, 0.62, 0.34, p.white, 130, 0.6);
@@ -381,6 +396,7 @@ export const PARTS = [
     hint: "三颗小星星，用于魔法/特效点缀",
     palette: { main: "#ffe9a3", accent: "#ffe9a3" },
     sym: false,
+    auto: { ax: 0.7, ay: 0.3 },
     draw(c, p) {
       const star = (cx, cy, r) => {
         poly(c, [[cx, cy - r], [cx + r * 0.35, cy - r * 0.35], [cx + r, cy], [cx + r * 0.35, cy + r * 0.35], [cx, cy + r], [cx - r * 0.35, cy + r * 0.35], [cx - r, cy], [cx - r * 0.35, cy - r * 0.35]], p.accent || "#ffe9a3");
@@ -396,6 +412,7 @@ export const PARTS = [
     hint: "绕脖一圈 + 一条垂下，适合戴在人形主体上",
     palette: { main: "#e14b6a", accent: "#a82b45" },
     sym: false,
+    auto: { ax: 0.5, ay: 0.74 },
     draw(c, p) {
       const main = p.main || "#e14b6a";
       box(c, 0.1, 0.36, 0.8, 0.2, main);
@@ -410,6 +427,7 @@ export const PARTS = [
     hint: "头顶金色圆环（天使/圣物）",
     palette: { main: "#ffe9a3", accent: "#f0b429" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.02, hang: "bottom" },
     draw(c, p) {
       arc(c, 0.5, 0.5, 0.44, 0.16, 0, 360, p.main || "#ffe9a3", 255, 0.1);
     },
@@ -420,6 +438,7 @@ export const PARTS = [
     hint: "深色项圈 + 中央宝石（宠物/骑士）",
     palette: { main: "#8a5a2b", accent: "#f0b429" },
     sym: true,
+    auto: { ax: 0.5, ay: 0.78 },
     draw(c, p) {
       box(c, 0.08, 0.32, 0.84, 0.16, p.main || "#8a5a2b");
       ell(c, 0.5, 0.6, 0.08, 0.08, p.accent || "#f0b429");
@@ -467,7 +486,8 @@ export function partKeys() {
  * 把一个部件画进目标画板。
  * @param {{w:number,h:number,setPx:Function}} cv
  * @param {string} key 部件名（见 PARTS，支持别名）
- * @param {{x?:number,y?:number,size?:number,variant?:string,color?:string,accent?:string,flip?:boolean}} opts
+ * @param {{x?:number,y?:number,size?:number,variant?:string,color?:string,accent?:string,flip?:boolean,origin?:string}} opts
+ *        x/y 默认是部件中心；不带 x/y 时按 part.auto 自动贴到主体（眼睛在脸、帽子在头顶）
  * @returns {boolean}
  */
 export function drawPartInto(cv, key, opts = {}) {
@@ -493,8 +513,36 @@ export function drawPartInto(cv, key, opts = {}) {
       }
     }
   }
-  const ox = Math.round(Number(opts.x ?? (cv.w - area) / 2));
-  const oy = Math.round(Number(opts.y ?? (cv.h - area) / 2));
+  // x/y 默认是部件中心点（画眼睛时最直觉）；给 origin:'top-left' 则按旧语义当左上角
+  const topLeft = String(opts.origin || '').toLowerCase() === 'top-left';
+  // 没传 x/y 时按「部件性格」自动贴到主体上：眼睛在脸、帽子在头顶、影子在脚下。
+  // 之前默认整张画布居中，帽子会卡在脸中间，照样得看图手调。
+  let defX = cv.w / 2;
+  let defY = cv.h / 2;
+  if (part.auto) {
+    const box = typeof cv.bbox === 'function' ? cv.bbox() : null;
+    if (box && box.w > 0 && box.h > 0) {
+      defX = box.minX + box.w * part.auto.ax;
+      defY = box.minY + box.h * part.auto.ay;
+      // hang:'bottom' —— 部件的底边对齐主体顶部（帽子/光环/耳朵这类「戴在头上」的）
+      if (part.auto.hang === 'bottom') {
+        // 头顶可能已经戴了东西（耳朵/先贴的帽子）：不能再贴主体顶，要接着往上堆，
+        // 否则两件同一落点的部件会完全重叠。向上张望主体顶以上的已有内容。
+        let top = box.minY;
+        for (let y = box.minY - 1; y >= 0; y--) {
+          let rowHas = false;
+          for (let x = 0; x < cv.w; x++) {
+            if (cv.a(x, y) > 8) { rowHas = true; break; }
+          }
+          if (!rowHas) break;
+          top = y;
+        }
+        defY = top - area / 2 + 2;
+      }
+    }
+  }
+  const ox = Math.round(Number(opts.x ?? defX) - (topLeft ? 0 : area / 2));
+  const oy = Math.round(Number(opts.y ?? defY) - (topLeft ? 0 : area / 2));
   for (let y = 0; y < area; y++) {
     for (let x = 0; x < area; x++) {
       const i = (y * area + x) * 4;

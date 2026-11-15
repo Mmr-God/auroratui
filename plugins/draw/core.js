@@ -137,11 +137,14 @@ export class Canvas {
     this.h = Math.max(1, Math.round(h));
     this.data = new Uint8ClampedArray(this.w * this.h * 4);
     this.pen = { x: Math.floor(this.w / 2), y: Math.floor(this.h / 2) };
+    /** 选区 {x,y,w,h}；null = 全画布。setPx 会自动裁掉区外像素 */
+    this.sel = null;
   }
   clone() {
     const c = new Canvas(this.w, this.h);
     c.data.set(this.data);
     c.pen = { ...this.pen };
+    c.sel = this.sel ? { ...this.sel } : null;
     return c;
   }
   /** 画点（alpha<255 时按 alpha 混合，便于做阴影/高光） */
@@ -149,6 +152,11 @@ export class Canvas {
     x = Math.round(x);
     y = Math.round(y);
     if (x < 0 || y < 0 || x >= this.w || y >= this.h) return;
+    // 选区：区外一律不画（选中一块就能安全地改局部）
+    if (this.sel) {
+      const s = this.sel;
+      if (x < s.x || y < s.y || x >= s.x + s.w || y >= s.y + s.h) return;
+    }
     const [r, g, b] = hexToRgb(hex);
     const i = (y * this.w + x) * 4;
     const a = Math.max(0, Math.min(255, Math.round(alpha)));
@@ -542,6 +550,26 @@ export class Canvas {
     }
     return out;
   }
+  /**
+   * 轮廓瑕疵：凹洞（1px 的洞，4 面全被不透明包住）——这是零误报的。
+   * 为什么不管「凸点」：一个 1px 的小凸起，跟圆形/弧线顶点的局部像素
+   * 长得一模一样，做不出来不误报的判据。嘶狼来了比不报更糟，所以只报凹洞。
+   * 返回 [{x, y, type:'凹'}]。
+   */
+  edgeSpurs(limit = 24) {
+    const out = [];
+    const A = (x, y) => this.a(x, y) > 8;
+    const inBox = (x, y) => x >= 0 && y >= 0 && x < this.w && y < this.h;
+    const N4 = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+    for (let y = 1; y < this.h - 1 && out.length < limit; y++) {
+      for (let x = 1; x < this.w - 1 && out.length < limit; x++) {
+        if (A(x, y)) continue;
+        if (!N4.every(([dx, dy]) => A(x + dx, y + dy))) continue;
+        out.push({ x, y, type: '凹' });
+      }
+    }
+    return out;
+  }
   /** 减色：只保留最常见的 n 种颜色，其余映射到最近色（画完收尾用） */
   reducePalette(n = 16) {
     const { list } = this.colorStats(4096);
@@ -569,6 +597,198 @@ export class Canvas {
     }
     return keep;
   }
+
+  // ------------------------------------------------------------ 选区
+  /**
+   * 设置选区（clipping mask）。选区内的像素保留，区外一律置透明。
+   * 后续所有绘制只作用于选区（见 applyOp），改局部不再靠 erase 重画。
+   */
+  select(x, y, w, h) {
+    const x0 = Math.max(0, Math.min(this.w - 1, Math.round(x)));
+    const y0 = Math.max(0, Math.min(this.h - 1, Math.round(y)));
+    const x1 = Math.min(this.w, Math.round(x + w));
+    const y1 = Math.min(this.h, Math.round(y + h));
+    this.sel = x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+    return this.sel;
+  }
+  selectNone() { this.sel = null; }
+  /** 该像素是否在选区内（无选区时永远 true） */
+  inSel(x, y) {
+    if (!this.sel) return true;
+    const s = this.sel;
+    return x >= s.x && y >= s.y && x < s.x + s.w && y < s.y + s.h;
+  }
+
+  // ------------------------------------------------------------ 变换
+  /** 旋转 90 的整数倍（1=90° 顺时针，2=180°，3=270°） */
+  rotate(quarters = 1) {
+    const q = ((Math.round(quarters) % 4) + 4) % 4;
+    if (!q) return;
+    const { w, h, data } = this;
+    const swap = q % 2 === 1;
+    const nw = swap ? h : w;
+    const nh = swap ? w : h;
+    const out = new Uint8ClampedArray(nw * nh * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let nx;
+        let ny;
+        if (q === 1) { nx = h - 1 - y; ny = x; }
+        else if (q === 2) { nx = w - 1 - x; ny = h - 1 - y; }
+        else { nx = y; ny = w - 1 - x; }
+        const si = (y * w + x) * 4;
+        const di = (ny * nw + nx) * 4;
+        out[di] = data[si]; out[di + 1] = data[si + 1]; out[di + 2] = data[si + 2]; out[di + 3] = data[si + 3];
+      }
+    }
+    this.w = nw; this.h = nh; this.data = out; this.sel = null;
+  }
+  /** 最近邻缩放整体内容（k>1 放大，k<1 缩小），保持画布尺寸 */
+  scale(k) {
+    const f = Number(k);
+    if (!Number.isFinite(f) || f <= 0 || f === 1) return;
+    const { w, h, data } = this;
+    const out = new Uint8ClampedArray(data.length);
+    // 以「内容包围盒中心」为锚点缩放：贴边的画放大时才不会整体飞出画布
+    const box = this.bbox();
+    const cx = box ? (box.minX + box.maxX) / 2 : (w - 1) / 2;
+    const cy = box ? (box.minY + box.maxY) / 2 : (h - 1) / 2;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const sx = Math.round(cx + (x - cx) / f);
+        const sy = Math.round(cy + (y - cy) / f);
+        if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+        const si = (sy * w + sx) * 4;
+        const di = (y * w + x) * 4;
+        out[di] = data[si]; out[di + 1] = data[si + 1]; out[di + 2] = data[si + 2]; out[di + 3] = data[si + 3];
+      }
+    }
+    this.data = out;
+  }
+  /** 水平翻转整体内容（真翻转，不是镜像补全） */
+  flipH() {
+    const { w, h, data } = this;
+    const out = new Uint8ClampedArray(data.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const si = (y * w + x) * 4;
+        const di = (y * w + (w - 1 - x)) * 4;
+        for (let k = 0; k < 4; k++) out[di + k] = data[si + k];
+      }
+    }
+    this.data = out;
+  }
+  /** 垂直翻转整体内容 */
+  flipV() {
+    const { w, h, data } = this;
+    const out = new Uint8ClampedArray(data.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const si = (y * w + x) * 4;
+        const di = ((h - 1 - y) * w + x) * 4;
+        for (let k = 0; k < 4; k++) out[di + k] = data[si + k];
+      }
+    }
+    this.data = out;
+  }
+
+  // -------------------------------------------------------- 自动配色
+  /**
+   * 自动描边：从主体主色推出一个暗色描边，给所有不透明区域加 1px 内描边。
+   * 不用 AI 手写 hex，配色一定协调。
+   */
+  autoOutline(k = 0.28, mode = 'in') {
+    const colors = this.subjectColors(3);
+    let base = colors[0] || '#3b82f6';
+    const [r, g, b] = hexToRgb(base);
+    // 保留一点色相，只压亮度（纯黑描边在浅色主体上很脏）
+    const kk = Math.max(0.05, Math.min(1, Number(k) || 0.28));
+    const dark = `#${[r, g, b].map((v) => Math.max(0, Math.round(v * kk)).toString(16).padStart(2, '0')).join('')}`;
+    if (mode === 'out') this.outlineOut(dark);
+    else this.outlineIn(dark);
+    return dark;
+  }
+  /**
+   * 自动明暗：按主体主色做「上亮下暗」的纵向渐变，一步做出体积感。
+   * 只改跟主色相近的像素，眼睛/高光这类对比色细节会保留。
+   */
+  autoShade(amount = 0.22) {
+    const colors = this.subjectColors(6);
+    const base = colors[0] || '#3b82f6';
+    const amt = Math.max(0.05, Math.min(0.6, Number(amount) || 0.22));
+    const light = mix(base, '#ffffff', amt);
+    const dark = mix(base, '#000000', amt);
+    const bgm = this.bgMask();
+    // 整片都是同一色时 bgMask 会把主体误判成背景，那样这里什么也改不了。
+    // 所以「背景」盖住了几乎全部不透明像素时，直接当没有背景处理。
+    let opaque = 0;
+    let covered = 0;
+    if (bgm) {
+      for (let i = 0, p = 0; i < this.data.length; i += 4, p++) {
+        if (this.data[i + 3] <= 8) continue;
+        opaque++;
+        if (bgm[p]) covered++;
+      }
+    }
+    const useBg = !!bgm && opaque > 0 && covered / opaque < 0.92;
+    const box = useBg ? this.bboxMasked(bgm) : this.bbox();
+    if (!box) return { light, dark };
+    const [br, bg, bb] = hexToRgb(base);
+    const [lr, lg, lb] = hexToRgb(light);
+    const [dr, dg, db] = hexToRgb(dark);
+    const src = new Uint8ClampedArray(this.data);
+    const span = Math.max(1, box.h - 1);
+    for (let y = box.minY; y <= box.maxY; y++) {
+      // t: 0 = 顶（亮）, 1 = 底（暗）；用平滑曲线，避免三分段硬边
+      const t = (y - box.minY) / span;
+      const e = t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t); // easeInOut
+      for (let x = box.minX; x <= box.maxX; x++) {
+        const i = (y * this.w + x) * 4;
+        if (src[i + 3] <= 8) continue;
+        if (useBg && bgm[y * this.w + x]) continue;
+        // 只改「跟主色相近」的像素，对比色细节（眼白/瞳孔/高光）保留
+        const d0 = src[i] - br;
+        const d1 = src[i + 1] - bg;
+        const d2 = src[i + 2] - bb;
+        const dist = Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+        if (dist > 70) continue;
+        const fade = 1 - dist / 70; // 越接近主色改得越多，边缘过渡自然
+        const tr = src[i] + ((e < 0.5 ? lr : dr) - src[i]) * Math.abs(e - 0.5) * 2 * fade;
+        const tg = src[i + 1] + ((e < 0.5 ? lg : dg) - src[i + 1]) * Math.abs(e - 0.5) * 2 * fade;
+        const tb = src[i + 2] + ((e < 0.5 ? lb : db) - src[i + 2]) * Math.abs(e - 0.5) * 2 * fade;
+        this.data[i] = Math.round(tr);
+        this.data[i + 1] = Math.round(tg);
+        this.data[i + 2] = Math.round(tb);
+      }
+    }
+    return { light, dark };
+  }
+  /** 主体（排除背景）最常见的几种颜色 */
+  subjectColors(limit = 4) {
+    const bgm = this.bgMask();
+    // bgMask 在「整片同一色」时会把主体当背景 —— 此时忽略它，否则主色会算成空
+    let opaque = 0;
+    let covered = 0;
+    if (bgm) {
+      for (let i = 0, p = 0; i < this.data.length; i += 4, p++) {
+        if (this.data[i + 3] <= 8) continue;
+        opaque++;
+        if (bgm[p]) covered++;
+      }
+    }
+    const useBg = !!bgm && opaque > 0 && covered / opaque < 0.92;
+    const map = new Map();
+    for (let y = 0; y < this.h; y++) {
+      for (let x = 0; x < this.w; x++) {
+        const i = (y * this.w + x) * 4;
+        if (this.data[i + 3] <= 8) continue;
+        if (useBg && bgm[y * this.w + x]) continue;
+        const hex = toHex([this.data[i], this.data[i + 1], this.data[i + 2]]);
+        map.set(hex, (map.get(hex) || 0) + 1);
+      }
+    }
+    return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([h]) => h);
+  }
 }
 
 /**
@@ -594,6 +814,70 @@ export function cropCanvas(cv, x, y, w, h) {
   return out;
 }
 
+/**
+ * 在图上叠加坐标网格（只在导出/预览时用，不改画板）。
+ * step 为每隔多少像素画一条线；标尺画在图片外框（不遮主体）。
+ */
+export function overlayGrid(cv, step = 8, color = '#ff00ff', alpha = 150) {
+  const out = new Canvas(cv.w, cv.h);
+  out.data.set(cv.data);
+  const sa = splitAlpha(color);
+  const hexc = sa.hex;
+  const a = sa.alpha != null ? sa.alpha : alpha;
+  const s = Math.max(2, Math.round(step));
+  for (let x = 0; x < cv.w; x += s) {
+    for (let y = 0; y < cv.h; y++) out.setPx(x, y, hexc, a);
+  }
+  for (let y = 0; y < cv.h; y += s) {
+    for (let x = 0; x < cv.w; x++) out.setPx(x, y, hexc, a);
+  }
+  return out;
+}
+/**
+ * 把画布上的一块区域复制到另一个位置（支持水平/垂直翻转）。
+ * 常见用法：画好一只耳朵，复制+翻转贴到另一边；或者复刻整块花纹。
+ * @returns {boolean} 是否真的复制了（源区为空/越界返回 false）
+ */
+export function copyRegion(cv, sx, sy, w, h, dx, dy, opts = {}) {
+  w = Math.max(1, Math.round(w));
+  h = Math.max(1, Math.round(h));
+  sx = Math.round(sx);
+  sy = Math.round(sy);
+  // 先把源区拷出来（重叠复制时不会自己盖自己）
+  const buf = new Uint8ClampedArray(w * h * 4);
+  let any = false;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const ox = sx + x;
+      const oy = sy + y;
+      if (ox < 0 || oy < 0 || ox >= cv.w || oy >= cv.h) continue;
+      const si = (oy * cv.w + ox) * 4;
+      const di = (y * w + x) * 4;
+      buf[di] = cv.data[si];
+      buf[di + 1] = cv.data[si + 1];
+      buf[di + 2] = cv.data[si + 2];
+      buf[di + 3] = cv.data[si + 3];
+      if (cv.data[si + 3] > 8) any = true;
+    }
+  }
+  if (!any) return false;
+  const flipX = opts.flipX === true;
+  const flipY = opts.flipY === true;
+  const eraseSrc = opts.eraseSrc === true;
+  if (eraseSrc) cv.clearRegion(sx, sy, w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const bx = flipX ? w - 1 - x : x;
+      const by = flipY ? h - 1 - y : y;
+      const si = (by * w + bx) * 4;
+      if (buf[si + 3] <= 0) continue;
+      const hex = toHex([buf[si], buf[si + 1], buf[si + 2]]);
+      cv.setPx(dx + x, dy + y, hex, buf[si + 3]);
+    }
+  }
+  return true;
+}
+
 // ------------------------------------------------------------- 操作解释器
 const num = (v, f = 0) => {
   const n = Number(v);
@@ -606,7 +890,10 @@ export const OP_NAMES = [
   'pixel', 'line', 'fill_rect', 'rect', 'fill_ellipse', 'ellipse',
   'fill_poly', 'flood_fill', 'outline_in', 'outline_out', 'gradient',
   'mirror_x', 'mirror_y', 'margin', 'shift', 'erase', 'clear',
-  'palette', 'spray',
+  'palette', 'spray', 'noise',
+  'select', 'select_none', 'copy_region',
+  'rotate', 'scale', 'flip_h', 'flip_v',
+  'auto_outline', 'auto_shade',
 ];
 
 /**
@@ -683,6 +970,65 @@ export function applyOp(cv, op) {
     case 'palette': case 'reduce_palette': case 'quantize':
       cv.reducePalette(num(op.colors ?? op.n, 16));
       return true;
+    // ---------------------------------------------------------- 选区
+    case 'select': case 'region': case 'clip': {
+      const s = cv.select(X(op.x), Y(op.y), num(op.w, cv.w), num(op.h, op.w ?? cv.h));
+      return !!s;
+    }
+    case 'select_none': case 'unselect': case 'deselect':
+      cv.selectNone();
+      return true;
+    case 'copy_region': case 'copy': case 'clone_region': case 'stamp_region': {
+      // 源区：x/y/w/h；目标：dx/dy；sx/sy 也当源坐标的别名
+      const sx = X(op.sx ?? op.fx ?? op.x);
+      const sy = Y(op.sy ?? op.fy ?? op.y);
+      const rw = num(op.w, num(op.src_w, cv.w - sx));
+      const rh = num(op.h, num(op.src_h, cv.h - sy));
+      const dx = num(op.dx, num(op.to_x, sx + rw));
+      const dy = num(op.dy, num(op.to_y, sy));
+      copyRegion(cv, sx, sy, rw, rh, dx, dy, {
+        flipX: op.flip_x === true || op.flipX === true,
+        flipY: op.flip_y === true || op.flipY === true,
+        eraseSrc: op.erase_src === true || op.move === true,
+      });
+      // 源区是空的也算「op 合法」，只是没东西可复制（不算错误）
+      return true;
+    }
+    // ---------------------------------------------------------- 变换
+    case 'rotate': case 'rotate_90': case 'turn': {
+      // 接受 90/180/270，也接受 1/2/3（四分之一圈数）
+      let deg = num(op.deg ?? op.angle ?? op.times ?? op.n, 1);
+      let q;
+      if (Math.abs(deg) <= 4 && !op.deg && !op.angle) q = Math.round(deg); // 1/2/3 圈数
+      else {
+        deg = ((Math.round(deg / 90) * 90) % 360 + 360) % 360;
+        q = deg / 90;
+      }
+      cv.rotate(q);
+      return true;
+    }
+    case 'scale': case 'resize_content': case 'zoom': {
+      const k = num(op.k ?? op.factor ?? op.by ?? op.n, 1);
+      if (!(k > 0)) return false;
+      cv.scale(k);
+      return true;
+    }
+    case 'flip_h': case 'flip_horizontal': case 'flip':
+      cv.flipH();
+      return true;
+    case 'flip_v': case 'flip_vertical':
+      cv.flipV();
+      return true;
+    // -------------------------------------------------------- 自动配色
+    case 'auto_outline': case 'auto_stroke': {
+      const k = op.darkness ?? op.strength ?? op.k;
+      cv.autoOutline(k == null ? 0.28 : num(k, 0.28), op.mode === 'out' || op.outer === true ? 'out' : 'in');
+      return true;
+    }
+    case 'auto_shade': case 'shade': case 'bevel': {
+      cv.autoShade(op.amount == null ? 0.22 : num(op.amount, 0.22));
+      return true;
+    }
     case 'spray': case 'noise': {
       // 喷洒/噪点：在半径内随机打点（做草地、星点、材质）
       let seed = Math.abs(Math.round(num(op.seed, 12345))) || 1;

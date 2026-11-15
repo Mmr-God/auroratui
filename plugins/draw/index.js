@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-  Canvas, applyOps, encodePngScaled, asciiPreview, resolveColor, shade, OP_NAMES, cropCanvas,
+  Canvas, applyOps, encodePngScaled, asciiPreview, resolveColor, shade, OP_NAMES, cropCanvas, overlayGrid,
 } from './core.js';
 import { drawRecipeInto, recipeKeys, SUBJECT_RECIPES } from './recipes.js';
 import { drawPartInto, partKeys, findPart } from './parts.js';
@@ -122,6 +122,12 @@ function diagnose(cv) {
   }
   const iso = cv.isolated();
   if (iso.length) tips.push(`有 ${iso.length} 个孤立像素（噪点），可能是坐标写错：${iso.slice(0, 3).map((p) => `(${p[0]},${p[1]})`).join(' ')}`);
+  // 轮廓毛刺：凸/凹 1px 的小格子，多半是某格填错/漏填
+  const spurs = cv.edgeSpurs(12);
+  if (spurs.length) {
+    const sample = spurs.slice(0, 4).map((s) => `(${s.x},${s.y})${s.type}`).join(' ');
+    tips.push(`轮廓上有 ${spurs.length} 处毛刺（凸=多一格、凹=少一格）：${sample}；用 erase/pixel 修掉更干净`);
+  }
   // 渐变会自然产生很多中间色：有背景时放宽阈值，别催着量化
   const maxColors = bgm ? 64 : 16;
   if (stats.unique > maxColors) {
@@ -139,6 +145,7 @@ function applyStamp(cv, op) {
     x: op.x == null ? undefined : Number(op.x),
     y: op.y == null ? undefined : Number(op.y),
     size: op.size == null ? undefined : Number(op.size),
+    origin: op.origin || op.anchorMode,
   });
   return ok;
 }
@@ -155,6 +162,7 @@ function applyPart(cv, op) {
     color: op.color || op.main ? resolveColor(op.color || op.main) : undefined,
     accent: op.accent ? resolveColor(op.accent) : undefined,
     flip: op.flip === true || op.flip === 'true',
+    origin: op.origin || op.anchorMode,
   });
 }
 
@@ -191,6 +199,10 @@ export const drawTool = {
       crop: {
         type: 'object',
         description: '只看局部：{"x":..,"y":..,"w":..,"h":..}，把这一块裁出来放大成这次的图（不改画板）。画眼睛这种 1~2 像素的细节时必用',
+      },
+      grid: {
+        type: ['number', 'boolean'],
+        description: '叠加坐标网格：true=每 8px 一条线，或给数字指定间隔（如 16）。只在导出的图上有，不改画板；用来量「这东西到底在哪个坐标」',
       },
       save: { type: 'string', description: '额外另存一份 PNG 的路径（相对 cwd）' },
       stats: { type: 'boolean', description: 'true 时附上完整配色统计（默认只给摘要）' },
@@ -265,8 +277,15 @@ export const drawTool = {
       cropped = cropCanvas(cv, Number(c.x || 0), Number(c.y || 0), Number(c.w ?? cv.w), Number(c.h ?? cv.h));
       if (cropped.w && cropped.h) shown = cropped;
     }
+    // grid：叠加坐标网格（只在导出图上画，不改画板），方便定位元素坐标
+    let gridded = false;
+    if (input?.grid) {
+      const gstep = typeof input.grid === 'number' ? input.grid : 8;
+      shown = overlayGrid(shown, gstep);
+      gridded = true;
+    }
     const png = encodePngScaled(shown.w, shown.h, shown.data, scale);
-    const file = path.join(dir, `${name}${cropped ? `_crop${cropped.w}x${cropped.h}` : ''}.png`);
+    const file = path.join(dir, `${name}${cropped ? `_crop${cropped.w}x${cropped.h}` : ''}${gridded ? '_grid' : ''}.png`);
     fs.writeFileSync(file, png);
     let extraPath = '';
     if (input?.save) {

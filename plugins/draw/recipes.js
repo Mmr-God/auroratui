@@ -482,8 +482,10 @@ export function drawRecipeInto(cv, key, overrides = {}, opts = {}) {
   const s = Math.max(4, Math.min(256, area));
   const c = makeCanvas(s);
   rec.draw(c, paletteFor(rec.key, overrides));
-  const ox = Math.round(opts.x ?? Math.floor((cv.w - s) / 2));
-  const oy = Math.round(opts.y ?? Math.floor((cv.h - s) / 2));
+  // x/y 默认是配方主体的中心点（跟 part 一致，避免「以为在中间其实歪到角落」）
+  const topLeft = String(opts.origin || "").toLowerCase() === "top-left";
+  const ox = Math.round((opts.x ?? cv.w / 2) - (topLeft ? 0 : s / 2));
+  const oy = Math.round((opts.y ?? cv.h / 2) - (topLeft ? 0 : s / 2));
   for (let y = 0; y < s; y++) {
     for (let x = 0; x < s; x++) {
       const i = (y * s + x) * 4;

@@ -247,5 +247,102 @@ check('空画板给出提示', /空的/.test(empty.content), empty.content.split
   check('所有配方都能画出东西', bad.length === 0, bad.join(','));
 }
 
+// ------------------------------------------- 选区 select / 区域复制 copy_region
+{
+  const cv = new Canvas(16, 16);
+  applyOps(cv, [{ op: 'fill_rect', x: 0, y: 0, w: 16, h: 16, color: '#111111' }]);
+  applyOps(cv, [{ op: 'select', x: 4, y: 4, w: 6, h: 6 }]);
+  applyOps(cv, [{ op: 'fill_rect', x: 0, y: 0, w: 16, h: 16, color: '#ff0000' }]);
+  check('选中后只有选区内被画到', px(cv, 5, 5).join() === '255,0,0,255' && px(cv, 1, 1).join() === '17,17,17,255', `${px(cv, 5, 5)} / ${px(cv, 1, 1)}`);
+  applyOps(cv, [{ op: 'select_none' }]);
+  applyOps(cv, [{ op: 'fill_rect', x: 0, y: 0, w: 2, h: 2, color: '#00ff00' }]);
+  check('取消选区后恢复全画布可画', px(cv, 1, 1).join() === '0,255,0,255', px(cv, 1, 1).join());
+
+  const cv2 = new Canvas(16, 16);
+  applyOps(cv2, [
+    { op: 'fill_rect', x: 2, y: 2, w: 4, h: 4, color: '#0000ff' },
+    { op: 'copy_region', sx: 2, sy: 2, w: 4, h: 4, dx: 9, dy: 9 },
+  ]);
+  check('copy_region 把块复制到新位置', px(cv2, 10, 10).join() === '0,0,255,255' && px(cv2, 3, 3).join() === '0,0,255,255');
+  const cv3 = new Canvas(16, 16);
+  applyOps(cv3, [
+    { op: 'fill_rect', x: 0, y: 4, w: 3, h: 4, color: '#ffffff' },
+    { op: 'copy_region', sx: 0, sy: 4, w: 3, h: 4, dx: 9, dy: 4, flip_x: true },
+  ]);
+  check('copy_region 支持 flip_x', px(cv3, 9, 4).join() === '255,255,255,255' && px(cv3, 11, 4).join() === '255,255,255,255');
+}
+
+// ----------------------------------------------- 自动配色 auto_outline/auto_shade
+{
+  const cv = new Canvas(32, 32);
+  applyOps(cv, [{ op: 'fill_ellipse', cx: 16, cy: 16, rx: 12, ry: 12, color: '#3b82f6' }]);
+  const dark = cv.autoOutline(0.3);
+  check('auto_outline 由主色推出更暗的描边色', resolveColor(dark) !== '#3b82f6' && /^#[0-9a-f]{6}$/.test(dark), dark);
+  const edge = px(cv, 16, 4);
+  check('auto_outline 真的把边缘换成描边色', `#${edge.slice(0, 3).map((v) => v.toString(16).padStart(2, '0')).join('')}` === dark, edge.join());
+
+  const cv2 = new Canvas(32, 32);
+  applyOps(cv2, [{ op: 'fill_rect', x: 0, y: 0, w: 32, h: 32, color: '#3b82f6' }]);
+  cv2.autoShade(0.3);
+  const top = px(cv2, 16, 1);
+  const bot = px(cv2, 16, 30);
+  check('auto_shade 上亮下暗', top[0] + top[1] + top[2] > bot[0] + bot[1] + bot[2], `${top} vs ${bot}`);
+
+  // 细节不该被 auto_shade 洗掉
+  const cv3 = new Canvas(32, 32);
+  applyOps(cv3, [
+    { op: 'fill_rect', x: 0, y: 0, w: 32, h: 32, color: '#3b82f6' },
+    { op: 'fill_rect', x: 14, y: 14, w: 4, h: 4, color: '#ffffff' },
+  ]);
+  cv3.autoShade(0.4);
+  check('auto_shade 保留对比色细节（白点仍是白的）', px(cv3, 15, 15).join() === '255,255,255,255', px(cv3, 15, 15).join());
+}
+
+// ------------------------------------------------------ 变换 rotate/scale/flip
+{
+  const cv = new Canvas(8, 4);
+  applyOps(cv, [{ op: 'fill_rect', x: 0, y: 0, w: 2, h: 1, color: '#ff0000' }]);
+  applyOps(cv, [{ op: 'rotate', deg: 90 }]);
+  check('rotate 90 交换长宽', cv.w === 4 && cv.h === 8, `${cv.w}x${cv.h}`);
+  check('rotate 90 后左上角的块跑到右上角', px(cv, 3, 0).join() === '255,0,0,255', px(cv, 3, 0).join());
+
+  const cv2 = new Canvas(8, 4);
+  applyOps(cv2, [{ op: 'fill_rect', x: 0, y: 0, w: 2, h: 1, color: '#ff0000' }]);
+  applyOps(cv2, [{ op: 'flip_h' }]);
+  check('flip_h 左右翻转', px(cv2, 7, 0).join() === '255,0,0,255' && px(cv2, 0, 0).join() !== '255,0,0,255');
+
+  const cv3 = new Canvas(8, 8);
+  applyOps(cv3, [{ op: 'fill_rect', x: 2, y: 2, w: 2, h: 2, color: '#00ff00' }]);
+  const before3 = cv3.countOpaque();
+  applyOps(cv3, [{ op: 'scale', k: 2 }]);
+  check('scale 2× 后内容面积变大（以内容为中心缩放）', cv3.countOpaque() > before3 && cv3.countOpaque() >= before3 * 3, `${before3} → ${cv3.countOpaque()}`);
+}
+
+// ------------------------------------------------------------ grid 导出坐标网格
+{
+  const g = await run({ name: 'gridtest', size: 16, ops: [{ op: 'pixel', x: 0, y: 0, color: '#ffffff' }], view: true, grid: 4 });
+  check('grid 导出文件名带 _grid', fs.existsSync(path.join(WS, 'drawings', 'gridtest_grid.png')), g.meta.path);
+  check('grid 不改画板（meta 尺寸不变）', /^gridtest 16×16/.test(g.meta.summary), g.meta.summary);
+  const nogrid = await run({ name: 'gridtest', view: true });
+  check('不传 grid 时文件名不带 _grid', !/_grid/.test(nogrid.meta.path), nogrid.meta.path);
+  check('grid 覆盖的像素不污染画板存档', (() => {
+    const b = JSON.parse(fs.readFileSync(path.join(HOME, 'draw', 'gridtest.json'), 'utf8'));
+    const buf = Buffer.from(b.data, 'base64');
+    return buf[3] === 255 && buf[4] === 0; // 只有 (0,0) 那一个白点，没有品红
+  })());
+}
+
+// ------------------------------------------------ noise 与 spray 同义
+{
+  const a = new Canvas(32, 32);
+  const b = new Canvas(32, 32);
+  applyOps(a, [{ op: 'spray', cx: 16, cy: 16, r: 8, count: 20, seed: 7, color: '#ffffff' }]);
+  applyOps(b, [{ op: 'noise', cx: 16, cy: 16, r: 8, count: 20, seed: 7, color: '#ffffff' }]);
+  check('noise 是 spray 的别名（同 seed 结果一致）', a.countOpaque() === b.countOpaque() && a.countOpaque() > 0, `${a.countOpaque()} vs ${b.countOpaque()}`);
+  const c = new Canvas(32, 32);
+  applyOps(c, [{ op: 'noise', cx: 16, cy: 16, r: 8, count: 20, seed: 7, color: '#ffffff' }]);
+  check('同 seed 的 noise 结果确定', c.countOpaque() === b.countOpaque());
+}
+
 log(failed ? `\n${failed} 项失败` : '\nALL DRAW CHECKS PASSED');
 process.exit(failed ? 1 : 0);

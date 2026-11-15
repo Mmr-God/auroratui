@@ -11,7 +11,7 @@ const WS = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-parts-ws-'));
 
 const { drawTool } = await import('../plugins/draw/index.js');
 const { PARTS, PART_KEYS, findPart, drawPartInto, partKeys } = await import('../plugins/draw/parts.js');
-const { Canvas } = await import('../plugins/draw/core.js');
+const { Canvas, applyOps } = await import('../plugins/draw/core.js');
 
 let failed = 0;
 const log = (m = '') => fs.writeSync(1, m + '\n');
@@ -64,10 +64,16 @@ check(
 // -------------------------------------------------- 定位：x/y 落在画板对应位置
 {
   const cv = new Canvas(64, 64);
-  drawPartInto(cv, 'crown', { x: 10, y: 4, size: 20 });
+  drawPartInto(cv, 'crown', { x: 10, y: 4, size: 20, origin: 'top-left' });
   const box = cv.bbox();
-  check('part 按 x/y 左上角定位', box.minX >= 10 && box.minX <= 13 && box.minY >= 4 && box.minY <= 7, JSON.stringify(box));
+  check('part 传 origin:top-left 时按左上角定位', box.minX >= 10 && box.minX <= 13 && box.minY >= 4 && box.minY <= 7, JSON.stringify(box));
   check('part 尺寸受 size 限制', box.maxX - box.minX <= 21 && box.maxY - box.minY <= 21, `${box.w}x${box.h}`);
+  // 默认：x/y 是部件中心点（眼睛这种细节对齐最直觉）
+  const cvC = new Canvas(64, 64);
+  drawPartInto(cvC, 'crown', { x: 32, y: 32, size: 20 });
+  const bc = cvC.bbox();
+  const ccx = (bc.minX + bc.maxX) / 2, ccy = (bc.minY + bc.maxY) / 2;
+  check('part 默认把 x/y 当中心点', Math.abs(ccx - 32) <= 2 && Math.abs(ccy - 32) <= 2, `实际中心 ${ccx},${ccy}`);
 }
 
 // ------------------------------------------------------------- 镜像语义
@@ -123,7 +129,7 @@ check(
   check('part op 支持别名', /应用 1 条 op/.test(r.content), r.content.split('\n')[0]);
 }
 {
-  const r = await run({ name: 'anchor', ops: [{ op: 'part', part: 'crown', anchor: [20, 10], x: 0, y: 0, size: 16 }] });
+  const r = await run({ name: 'anchor', ops: [{ op: 'part', part: 'crown', anchor: [20, 10], x: 0, y: 0, size: 16, origin: 'top-left' }] });
   check('part 支持 anchor 相对坐标', /应用 1 条 op/.test(r.content));
   const board = JSON.parse(fs.readFileSync(path.join(HOME, 'draw', 'anchor.json'), 'utf8'));
   const cv = new Canvas(board.w, board.h);
@@ -156,6 +162,77 @@ check(
 // ------------------------------------------- 工具说明里列出部件（模型看得到）
 check('工具说明含 part op 用法', /"op":"part"/.test(drawTool.description));
 check('工具说明列出了全部部件名', PART_KEYS.every((k) => drawTool.description.includes(k)));
+
+// ------------------------------------------- 自动贴位置：不传 x/y 就按部件性格落位
+{
+  // 一个「头大身子小」的主体：眼睛应该落在上半部，而不是画布正中
+  const mk = () => {
+    const cv = new Canvas(64, 64);
+    applyOps(cv, [{ op: 'fill_ellipse', cx: 32, cy: 40, rx: 20, ry: 20, color: '#3b82f6' }]);
+    return cv;
+  };
+  const subj = { minX: 12, minY: 20, maxX: 51, maxY: 59 };
+
+  // 只量「部件画上去的那部分」：先记下快照，贴完只看变化过的像素
+  const hitBox = (before, after) => {
+    let minX = 1e9, minY = 1e9, maxX = -1, maxY = -1;
+    for (let y = 0; y < after.h; y++) {
+      for (let x = 0; x < after.w; x++) {
+        const i = (y * after.w + x) * 4;
+        const same = before.data[i] === after.data[i] && before.data[i + 3] === after.data[i + 3];
+        if (same) continue;
+        minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      }
+    }
+    return maxX < 0 ? null : { minX, minY, maxX, maxY, w: maxX - minX + 1, h: maxY - minY + 1 };
+  };
+  const snap = (cv) => cv.clone();
+
+  const cvE = mk();
+  const snapE = snap(cvE);
+  drawPartInto(cvE, 'eyes', { size: 16 });
+  const be = hitBox(snapE, cvE);
+  check('eyes 不传 x/y 时落在主体上半部（不是画布正中）', be.minY < 40 && be.maxY < 50, JSON.stringify(be));
+  check('eyes 不传 x/y 时水平居中', Math.abs((be.minX + be.maxX) / 2 - 32) <= 3, `${(be.minX + be.maxX) / 2}`);
+
+  const cvM = mk();
+  const snapM = snap(cvM);
+  drawPartInto(cvM, 'mouth', { size: 12 });
+  const bm = hitBox(snapM, cvM);
+  check('mouth 不传 x/y 时落在眼下（主体 68% 高度附近）', (bm.minY + bm.maxY) / 2 > 45, `${(bm.minY + bm.maxY) / 2}`);
+
+  // 帽子靠 hang:bottom 贴在主体头顶外，而不是盖在脸上
+  const cvH = new Canvas(64, 64);
+  applyOps(cvH, [{ op: 'fill_rect', x: 20, y: 24, w: 24, h: 30, color: '#3b82f6' }]);
+  const snapH = snap(cvH);
+  drawPartInto(cvH, 'hat', { size: 32, variant: 'top' });
+  const bh = hitBox(snapH, cvH);
+  check('hat 不传 x/y 时戴在主体头顶（不压脸）', bh.minY < 24, `${bh.minY}~${bh.maxY}`);
+
+  // 显式给 x/y 时仍然以它为准，不被 auto 覆盖
+  const cvX = mk();
+  const snapX = snap(cvX);
+  drawPartInto(cvX, 'eyes', { size: 10, x: 20, y: 50 });
+  const bx = hitBox(snapX, cvX);
+  check('显式 x/y 优先于 auto 自动落位', Math.abs((bx.minX + bx.maxX) / 2 - 20) <= 3, `${(bx.minX + bx.maxX) / 2}`);
+
+  // 头顶堆叠两件（耳朵 + 皇冠）：不能都贴主体顶，不然完全重叠
+  const cvS = new Canvas(64, 64);
+  applyOps(cvS, [{ op: 'fill_rect', x: 20, y: 26, w: 24, h: 28, color: '#4ade80' }]);
+  drawPartInto(cvS, 'ears', { size: 20, variant: 'cat' });
+  const snap1 = cvS.clone();
+  drawPartInto(cvS, 'crown', { size: 16 });
+  const bcrown = hitBox(snap1, cvS);
+  check('头顶已有东西时，第二件继续往上堆而不是重叠', bcrown.maxY < 26, `${bcrown.minY}~${bcrown.maxY}`);
+
+  // 空画板时 auto 不能报错，退回画布中心
+  const cvEmpty = new Canvas(64, 64);
+  const okEmpty = drawPartInto(cvEmpty, 'eyes', { size: 12 });
+  check('空画板贴部件不报错（auto 退回中心）', okEmpty === true && cvEmpty.countOpaque() > 0);
+
+  void subj;
+}
 
 log(failed ? `\n${failed} check(s) failed` : '\nALL PARTS CHECKS PASSED');
 process.exit(failed ? 1 : 0);
