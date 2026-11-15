@@ -21,6 +21,7 @@ import {
   Canvas, applyOps, encodePngScaled, asciiPreview, resolveColor, shade, OP_NAMES, cropCanvas,
 } from './core.js';
 import { drawRecipeInto, recipeKeys, SUBJECT_RECIPES } from './recipes.js';
+import { drawPartInto, partKeys, findPart } from './parts.js';
 
 // 画板存档目录：跟随 AGENT_HOME（测试 / 便携安装），否则 ~/.agent/draw
 const AGENT_HOME = process.env.AGENT_HOME ? path.resolve(process.env.AGENT_HOME) : path.join(os.homedir(), '.agent');
@@ -142,6 +143,21 @@ function applyStamp(cv, op) {
   return ok;
 }
 
+/** 部件（眼/嘴/翅膀/帽子…）：按 anchor 相对坐标贴到画板上 */
+function applyPart(cv, op) {
+  const ax = Array.isArray(op.anchor) ? Number(op.anchor[0]) : 0;
+  const ay = Array.isArray(op.anchor) ? Number(op.anchor[1]) : 0;
+  return drawPartInto(cv, op.part || op.name || op.key, {
+    x: op.x == null ? undefined : Number(op.x) + ax,
+    y: op.y == null ? undefined : Number(op.y) + ay,
+    size: op.size == null ? undefined : Number(op.size),
+    variant: op.variant || op.kind || op.style,
+    color: op.color || op.main ? resolveColor(op.color || op.main) : undefined,
+    accent: op.accent ? resolveColor(op.accent) : undefined,
+    flip: op.flip === true || op.flip === 'true',
+  });
+}
+
 export const drawTool = {
   name: 'draw',
   label: 'Draw',
@@ -152,6 +168,9 @@ export const drawTool = {
     '- 起手最快：{"op":"stamp","recipe":"penguin"} —— 内置配方：' +
     recipeKeys().map((r) => r.key).join('/') +
     '，stamp 完再用 op 改细节\n' +
+    '- 贴零件：{"op":"part","part":"eyes","x":18,"y":24,"size":14} —— 内置部件：' +
+    partKeys().map((r) => `${r.key}${r.variants.length ? `(${r.variants.join('/')})` : ''}`).join(' ') +
+    '。画眼睛/嘴/翅膀这些 1~2px 的细节不要手算坐标，用 part 贴（支持 x/y/size/variant/color/accent/flip/anchor）\n' +
     '- 常用 op：fill_ellipse/fill_rect/fill_poly/line/pixel/ellipse/rect/flood_fill/outline_in/outline_out/' +
     'gradient/mirror_x/mirror_y/shift/erase/clear/margin/palette/noise\n' +
     '- 相对坐标：op 里给 "anchor":[x,y]，则 x/y/cx/cy/pts 都按相对锚点的偏移算\n' +
@@ -175,6 +194,7 @@ export const drawTool = {
       },
       save: { type: 'string', description: '额外另存一份 PNG 的路径（相对 cwd）' },
       stats: { type: 'boolean', description: 'true 时附上完整配色统计（默认只给摘要）' },
+      ascii: { type: 'boolean', description: 'true 时额外返回 48 行 ASCII 索引预览（默认不给：图已经附在结果里，这堆字符只占位置）' },
     },
     required: ['name'],
   },
@@ -214,9 +234,15 @@ export const drawTool = {
       history.push(snapshot(cv));
       while (history.length > HISTORY) history.shift();
       for (const op of ops) {
-        if (op && typeof op === 'object' && /^(stamp|recipe|subject)$/.test(String(op.op || '').toLowerCase())) {
+        const kind = String(op?.op || '').toLowerCase();
+        if (op && typeof op === 'object' && /^(stamp|recipe|subject)$/.test(kind)) {
           if (applyStamp(cv, op)) applied++;
           else bad.push({ ...op, _why: `未知配方 ${op.recipe ?? op.stamp ?? op.subject}（可用: ${SUBJECT_RECIPES.map((r) => r.key).join('/')}）` });
+          continue;
+        }
+        if (op && typeof op === 'object' && /^(part|parts|append|attach)$/.test(kind)) {
+          if (applyPart(cv, op)) applied++;
+          else bad.push({ ...op, _why: `未知部件 ${op.part ?? op.name}（可用: ${partKeys().map((r) => r.key).join('/')}）` });
           continue;
         }
         const r = applyOps(cv, [op]);
@@ -255,8 +281,11 @@ export const drawTool = {
     }
 
     // 4) 报告
+    // ASCII 预览默认关：一次 48 行网格 ~2.7k 字符，比图本身贵 5 倍，
+    // 而且模型看图靠的是附上来的 PNG，不是这堆索引字符。需要才传 ascii:true。
     const diag = diagnose(cv);
-    const pv = asciiPreview(shown, Math.min(48, Math.max(shown.w, shown.h)));
+    const wantAscii = input?.ascii === true || input?.ascii === 'true';
+    const pv = wantAscii ? asciiPreview(shown, Math.min(48, Math.max(shown.w, shown.h))) : null;
     const lines = [];
     lines.push(
       `画板「${name}」${created ? `新建 ${cv.w}×${cv.h}` : `沿用 ${cv.w}×${cv.h}`}` +
@@ -285,8 +314,10 @@ export const drawTool = {
     }
     lines.push(`配色 ${diag.stats.unique} 色：${diag.stats.list.slice(0, input?.stats ? 12 : 6).map((c) => `${c.hex}(${Math.round(c.pct * 100)}%)`).join(' ')}`);
     if (diag.tips.length) lines.push(...diag.tips.map((t) => `提示：${t}`));
-    lines.push(`ASCII 预览（. =透明，0-f =调色板索引 ${pv.palette.join(' ')}）：`);
-    lines.push(...pv.rows.map((r) => '  ' + r));
+    if (pv) {
+      lines.push(`ASCII 预览（. =透明，0-f =调色板索引 ${pv.palette.join(' ')}）：`);
+      lines.push(...pv.rows.map((r) => '  ' + r));
+    }
     lines.push('');
     lines.push(
       applied || changed

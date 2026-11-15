@@ -164,7 +164,9 @@ check('工具结果挂着图片（模型能直接看见）', Array.isArray(r.met
 check('挂的 base64 是真 PNG', Buffer.from(r.meta.images[0].base64, 'base64').slice(0, 4).toString('hex') === '89504e47');
 check('meta.kind = image（界面标 [图片]）', r.meta.kind === 'image');
 check('报告里有包围盒与配色', /包围盒/.test(r.content) && /配色/.test(r.content));
-check('报告里有 ASCII 预览', /ASCII 预览/.test(r.content));
+check('默认不返回 ASCII 预览（省字符）', !/ASCII 预览/.test(r.content), String(r.content.length));
+const withAscii = await run({ name: 'smoke', view: true, ascii: true });
+check('ascii:true 时才给 ASCII 预览', /ASCII 预览/.test(withAscii.content));
 
 // ------------------------------------------------ 同名画板接着改 + undo
 const before = r.meta.bytes;
@@ -227,6 +229,7 @@ check('空画板给出提示', /空的/.test(empty.content), empty.content.split
       { op: 'stamp', recipe: 'slime', size: 28, x: 18, y: 22 },
     ],
     view: true,
+    ascii: true,
   });
   check('识别出背景并单独算主体', /检测到底色\/背景/.test(bg.content) && /主体包围盒/.test(bg.content), bg.content.split(NL).find((l) => /背景/.test(l)) || '');
   check('有背景时不喊「主体贴到画布边缘」', !/主体贴到画布边缘/.test(bg.content));
