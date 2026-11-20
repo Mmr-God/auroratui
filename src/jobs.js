@@ -1,5 +1,5 @@
 // Shell job registry: every shell command the agent runs is recorded here so the
-// browser backend can list / tail / kill it. Kept dependency-free and tiny —
+// /shell and the TUI can list / tail / kill it. Kept dependency-free and tiny —
 // progress.js subscribes, shell.js writes.
 const MAX_JOBS = 200;
 const MAX_OUTPUT = 60_000; // chars kept per job
@@ -14,14 +14,17 @@ class JobRegistry {
     this.timer = null;
   }
 
-  add({ command, cwd, source = '主代理', session = '', timeout = 0 } = {}) {
+  add({ command, cwd, source = '主代理', session = '', timeout = 0, background = false } = {}) {
     const job = {
-      id: `sh${Date.now().toString(36)}${(++seq).toString(36)}`,
+      // 时间戳与序号之间用分隔符：否则一个 id 可能是另一个 id 的前缀
+      // （`shmwoqbxjs` 是 `shmwoqbxjs2` 的前缀），按前缀查找会误命中。
+      id: `sh${Date.now().toString(36)}-${(++seq).toString(36)}`,
       command: String(command || ''),
       cwd: String(cwd || ''),
       source: String(source || '主代理'),
       session: String(session || ''),
       timeout: Number(timeout) || 0,
+      background: !!background,
       status: 'running',
       code: null,
       started: Date.now(),
@@ -111,6 +114,7 @@ class JobRegistry {
       command: j.command,
       cwd: j.cwd,
       source: j.source,
+      background: j.background,
       status: j.status,
       code: j.code,
       started: j.started,
@@ -130,7 +134,7 @@ class JobRegistry {
 
   _notify() {
     if (!this.listeners.size) return;
-    // 合并高频进度更新：150ms 一次足够浏览器看
+    // 合并高频进度更新：150ms 一次就够了
     if (this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -139,7 +143,7 @@ class JobRegistry {
         try {
           fn(list);
         } catch {
-          /* 面板出错不影响命令执行 */
+          /* 订阅者报错不影响命令执行 */
         }
       }
     }, 150);

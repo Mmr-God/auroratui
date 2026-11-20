@@ -108,16 +108,6 @@ check('skill 展开注脚提到行数', /行/.test(vSkill.note), vSkill.note);
 const vTodo = describeTool(item('todo', { action: 'set' }, td));
 check('todo 封装：0/3 完成', vTodo.tags.some((t) => /0\/3 完成/.test(t.t)) && vTodo.summary.includes('下一项 a'), JSON.stringify(vTodo));
 
-const vBrowserOpen = describeTool(
-  item('browser', { action: 'open', url: 'https://a.com' }, { content: 'x', meta: { chars: 24300, url: 'https://a.com', title: 'T' } }),
-);
-check('browser open 封装：字符数小标', vBrowserOpen.tags.some((t) => /24k 字符/.test(t.t)) && vBrowserOpen.hint.includes('https://a.com'), JSON.stringify(vBrowserOpen));
-
-const vBrowserShot = describeTool(
-  item('browser', { action: 'screenshot', url: 'https://a.com' }, { content: 'x', meta: { bytes: 214000, size: '1280x900' } }),
-);
-check('browser screenshot 封装：尺寸 + 大小', vBrowserShot.tags.some((t) => t.t === '1280x900') && vBrowserShot.tags.some((t) => /KB/.test(t.t)), JSON.stringify(vBrowserShot));
-
 const vMemory = describeTool(item('memory', { action: 'list' }, { content: 'a = 1', meta: { action: 'list', count: 1, summary: '1 条记忆：a' } }));
 check('memory 封装：条数小标', vMemory.tags.some((t) => t.t === '1 条'), JSON.stringify(vMemory));
 

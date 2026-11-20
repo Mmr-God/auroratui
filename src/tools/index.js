@@ -1,5 +1,8 @@
 import { readTool, writeTool, editTool } from './fs.js';
+import { patchTool } from './patch.js';
 import { shellTool } from './shell.js';
+import { jobsTool } from './jobs.js';
+import { diagnosticsTool } from './diagnostics.js';
 import { webSearchTool, webFetchTool } from './web.js';
 import { contextTool } from './context.js';
 import { globTool, grepTool, lsTool, thinkTool } from './search.js';
@@ -8,15 +11,15 @@ import { todoTool, memoryTool } from './todo.js';
 import { gitTool, httpTool } from './git.js';
 import { skillTool } from './skill.js';
 import { pluginTool, pluginTools } from './plugin.js';
-import { browserTool } from './browser.js';
 import { subagentTool } from './subagent.js';
 import { teamTool } from './team.js';
 import { runPreHooks, runPostHooks } from './hooks.js';
 
 export const allTools = [
-  readTool, writeTool, editTool, shellTool,
+  readTool, writeTool, editTool, patchTool,
+  shellTool, jobsTool, diagnosticsTool,
   globTool, grepTool, lsTool, thinkTool, askTool,
-  webSearchTool, webFetchTool, browserTool, httpTool,
+  webSearchTool, webFetchTool, httpTool,
   gitTool, todoTool, memoryTool, skillTool,
   contextTool, pluginTool, subagentTool, teamTool,
 ];

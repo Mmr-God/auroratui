@@ -160,7 +160,7 @@ process.env.AGENT_CLIPBOARD_IMAGE_STUB = '1';
 resetOther();
 key('\x16');
 await wait(250);
-check('空剪贴板：输入不变且给出提示', app.askState?.other === '' && /没有文本可粘贴/.test(screen()), screen().split(NL).find((l) => /粘贴/.test(l)) || '');
+check('空剪贴板：输入不变且给出提示', app.askState?.other === '' && /没有文本可粘贴|剪贴板是空的/.test(screen()), screen().split(NL).find((l) => /粘贴/.test(l)) || '');
 
 // ------------------------------------------------- 6) 粘贴的内容能被提交
 process.env.AGENT_CLIPBOARD_STUB = '就用这个答案';

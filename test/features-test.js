@@ -1,5 +1,5 @@
 // Feature tests for the 2026-11 additions: mouse selection + clipboard, history
-// overlay, workspace guard (/trust), checkpoints (/undo), skills, hooks, browser.
+// overlay, workspace guard (/trust), checkpoints (/undo), skills, hooks.
 import { PassThrough } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -13,11 +13,10 @@ process.env.AGENT_CLIPBOARD_STUB_FILE = CLIP;
 
 const { Config } = await import('../src/config.js');
 const { App } = await import('../src/ui/app.js');
-const { stripAnsi } = await import('../src/util.js');
+const { stripAnsi, strWidth } = await import('../src/util.js');
 const { runTool } = await import('../src/tools/index.js');
 const { Checkpoints } = await import('../src/checkpoint.js');
 const { skillTool, listSkills } = await import('../src/tools/skill.js');
-const { findBrowser } = await import('../src/tools/browser.js');
 const { KeyParser } = await import('../src/ui/keys.js');
 
 const W = 100;
@@ -241,12 +240,6 @@ const withPost = await runTool({ id: '5', name: 'read', input: { path: 'hello.tx
 check('post hook note appended', /hook 说 ok/.test(withPost.content) && !withPost.isError);
 check('post hook actually executed', fs.existsSync(hookFile) && /read/.test(fs.readFileSync(hookFile, 'utf8')));
 
-// ------------------------------------------------------------------ browser
-const b = findBrowser();
-check('browser binary found', !!b && fs.existsSync(b), b);
-const bres = await runTool({ id: '6', name: 'browser', input: { action: 'open', url: 'not a real url' } }, { cwd: WS });
-check('browser tool returns text or clean error', typeof bres.content === 'string' && bres.content.length > 0);
-
 // ----------------------------------------------------------------- history
 app.agent.engine.addUser('会话测试消息');
 app.agent.engine.addAssistant({ content: '收到' });
@@ -296,6 +289,78 @@ check('/native toggles back', app.nativeMouse === false);
   app.openHistory();
   const f2 = snap();
   check('history shows two different titles', /fix the marker parser/.test(f2) && /add a todo list feature/.test(f2));
+  app.histOverlay = null;
+}
+
+// 历史面板：长标题必须自动换行、不能超过终端宽度；每条都要能看到工作区目录
+{
+  const px = await import('node:path');
+  const dir = px.join(process.env.AGENT_HOME, 'sessions');
+  const longTitle =
+    '写一个 Draw Skill 让 AI 拥有绘画能力并且可以直接观看自己画出来的图片然后不断改进最终达到像素风游戏美术的水准不要生成图片的模型也可以画';
+  fs.writeFileSync(
+    px.join(dir, 'svc-long.json'),
+    JSON.stringify({ id: 'svc-long', title: longTitle, cwd: WS, provider: 'local', model: 'cn:deepseek-v4.1-flash', updated: Date.now() + 1000, context: { nodes: [{ kind: 'message', message: { role: 'user', content: 'x' } }] } }),
+  );
+  const tall = app.height;
+  app.height = 24;
+  app.prevLines = [];
+  app.openHistory();
+  app.render(true);
+  const f3 = (app._painted || []).map((l) => stripAnsi(l)).join('\n');
+  app.height = tall;
+  // 按最终渲染的每行量宽度（缓冲区用的是光标定位，不能按 \n 切）
+  const rowsPlain = (app._painted || []).map((l) => stripAnsi(l));
+  const top = rowsPlain.findIndex((l) => /╭.*历史对话/.test(l));
+  const bot = rowsPlain.findIndex((l, i) => i > top && /^\s*╰/.test(l));
+  const box = top >= 0 && bot > top ? rowsPlain.slice(top, bot + 1) : [];
+  const bad = box.filter((l) => strWidth(l) > W);
+  check('history box lines never exceed terminal width', box.length > 5 && bad.length === 0, `${box.length} 行，超宽 ${bad.length} 行`);
+  check('history shows full workspace dir', /agent-ws-/.test(f3), (f3.match(/\S*agent-ws-\S*/) || [''])[0]);
+  check('long title wraps onto several lines', (f3.match(/写一个|Draw Skill|像素风|也可以画/g) || []).length >= 2, JSON.stringify((f3.match(/写一个|Draw Skill|像素风|也可以画/g) || []).join('|')));
+  check('every history row has both borders', box.every((l) => l.trim().length > 1 && /[│╭╰┤╮╯]/.test(l.trim().slice(-1))), box.filter((l) => !/[│╭╰┤╮╯]/.test(l.trim().slice(-1))).join(' ~ ').slice(0, 120));
+  check('selected row is marked', box.some((l) => l.includes('▏')));
+  app.histOverlay = null;
+}
+
+// 历史面板：Ctrl+R 改名写回文件
+{
+  const px = await import('node:path');
+  const dir = px.join(process.env.AGENT_HOME, 'sessions');
+  const target = px.join(dir, 'svc-beta.json');
+  app.openHistory();
+  app.histOverlay.sel = app.histOverlay.items.findIndex((s) => s.file === target);
+  app.histOverlay.filter = '';
+  key('\x12'); // Ctrl+R
+  await wait(40);
+  check('Ctrl+R 进入改名模式', app.histOverlay.rename != null, String(app.histOverlay.rename));
+  app.histOverlay.rename = '';
+  key('新的标题');
+  key('\r');
+  await wait(80);
+  const renamed = JSON.parse(fs.readFileSync(target, 'utf8'));
+  check('改名写回会话文件', renamed.title === '新的标题', renamed.title);
+  check('改名后退出改名模式', app.histOverlay && app.histOverlay.rename == null);
+  app.histOverlay = null;
+}
+
+// 历史面板：Ctrl+D 第一次只提示，第二次才删
+{
+  const px = await import('node:path');
+  const dir = px.join(process.env.AGENT_HOME, 'sessions');
+  const target = px.join(dir, 'svc-gamma.json');
+  fs.writeFileSync(
+    target,
+    JSON.stringify({ id: 'svc-gamma', title: '待删除会话', cwd: WS, provider: 'local', model: 'cn:x', updated: Date.now() + 2000, context: { nodes: [{ kind: 'message', message: { role: 'user', content: 'x' } }] } }),
+  );
+  app.openHistory();
+  app.histOverlay.sel = app.histOverlay.items.findIndex((s) => s.file === target);
+  key('\x04'); // Ctrl+D
+  await wait(60);
+  check('Ctrl+D 先要求确认', fs.existsSync(target) && /确认删除/.test(snap()));
+  key('\x04');
+  await wait(60);
+  check('再按 Ctrl+D 才删除', !fs.existsSync(target));
   app.histOverlay = null;
 }
 

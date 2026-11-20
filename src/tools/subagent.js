@@ -4,17 +4,18 @@
 //   1) 默认不下发给模型（config.settings.subagents=false，见 tools/index.js 的 GATED_TOOLS）；
 //   2) 即便模型硬调，这里也会再拦一次；
 //   3) 子代理内部一律关掉 subagent/team，防止无限套娃（深度上限见 settings.subagentDepth）。
-import { runSubagent } from '../subagent.js';
-import { ensureHub, Transcript } from '../progress.js';
+import { runSubagent, validateToolSpec, toolSpecError } from '../subagent.js';
+import { renderReport } from '../report.js';
+import { Transcript } from '../transcript.js';
 
 // 注意：不要在这里的顶层直接读写 ../subagent.js 导出的值（SUB_DEFAULT_TOOLS 等），
 // 因为 tools/index.js ↔ src/subagent.js 是循环引用，顶层取值会撞上 TDZ
 // （单独 import ../team.js 时尤其明显）。这些名字一律写死在描述里。
 const DEFAULT_TOOL_LIST =
-  'read / write / edit / shell / glob / grep / ls / think / todo / memory / skill / web_search / web_fetch / browser / http_request / git';
+  'read / write / edit / patch / shell / jobs / diagnostics / glob / grep / ls / think / todo / memory / skill / web_search / web_fetch / http_request / git';
 
-const solo = []; // 最近几个子代理的进度（推给面板用）
-const soloTr = new Map(); // id → 对话记录（面板上点开就能看全过程）
+const solo = []; // 最近几个子代理的进度（最新在最前，只留 8 条）
+const soloTr = new Map(); // id → 对话记录（出错时能回放他走了哪几步）
 
 function trOf(id) {
   let tr = soloTr.get(id);
@@ -54,14 +55,23 @@ export const subagentTool = {
         description: '交给子代理的自包含任务描述：要做什么、哪些文件/目录、不许动什么、怎么算做完（验收标准）。',
       },
       role: { type: 'string', description: '子代理的角色/专长，例如「测试工程师」「后端重构者」。会影响它的取舍。' },
-      name: { type: 'string', description: '给它起个短名字（面板上显示），例如「测试-1」。' },
+      name: { type: 'string', description: '给它起个短名字（进度里显示），例如「测试-1」。' },
       tools: {
         type: 'array',
         items: { type: 'string' },
-        description: `限定它能用的工具（默认全部开发工具）。常用裁剪：只读调查用 ["read","grep","glob","ls"]；只跑测试可加 "shell"。可用：${DEFAULT_TOOL_LIST}`,
+        description: `限定它能用的工具。可以写 preset 名（省得手敲）："scout" = 只读侦察（read/grep/glob/ls/think，碰不到写，适合「这东西在哪、怎么调用的」）、"readonly" = scout + git、"verify" = 只读 + shell（只能跑命令验证，不能改文件）。也可直接列工具名：${DEFAULT_TOOL_LIST}`,
       },
-      model: { type: 'string', description: '给子代理换一个模型（例如便宜快的模型做机械活），格式 model-id。' },
+      model: {
+        type: 'string',
+        description: '给子代理换一个模型（格式 model-id）。机械活（补测试、改格式、批量替换）走便宜快的模型能省一大笔；需要判断力的活再用跟你一样的模型。',
+      },
       max_steps: { type: 'integer', description: '步数上限，默认 40。简单活可给 15，复杂重构给 60。' },
+      verify: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '验收命令（强烈建议填）：它干完后我会**亲自跑一遍**，失败就自动给它一轮修正。例：["npm test"]、["npm run build", "npm test"]。不填就只能信它自己的口头验收。',
+      },
     },
     required: ['task'],
   },
@@ -86,6 +96,22 @@ export const subagentTool = {
     const task = String(input?.task || '').trim();
     if (!task) return { isError: true, content: 'task 不能为空：请写清目标、相关路径、约束、验收标准。' };
 
+    // 工具点名单先校验：拼错 / 点了禁用工具就当场报错，
+    // 别等到子代理起来才发现它拿的是全量工具（那样你以为它是只读的，它已经在改文件了）。
+    const rawTools = Array.isArray(input.tools) ? input.tools : input.tools ? [input.tools] : null;
+    if (rawTools) {
+      // 循环引用：tools/index.js ↔ 本模块，所以动态 import（和 src/subagent.js 一样）
+      let lookup = () => null;
+      try {
+        const mod = await import('./index.js');
+        lookup = mod.getTool;
+      } catch {}
+      const { ok, unknown, forbidden } = validateToolSpec(rawTools, lookup, {});
+      if (!ok) {
+        return { isError: true, content: `tools 参数有问题，没有派出子代理：\n${toolSpecError({ unknown, forbidden })}` };
+      }
+    }
+
     const name = String(input.name || '子代理').trim() || '子代理';
     const role = String(input.role || '').trim();
     const maxSteps = Math.max(1, Number(input.max_steps) || Number(cfg.settings?.subagentMaxSteps) || 40);
@@ -93,23 +119,15 @@ export const subagentTool = {
     const id = `s${Date.now().toString(36)}`;
     const startedAt = Date.now();
 
-    // 面板 + TUI 进度
+    // TUI 进度 + 对话记录（出错时能回放）
     const tr = trOf(id);
     tr.task(task + (role ? `\n\n角色：${role}` : ''));
-    const hub = await ensureHub(cfg);
-    if (hub) {
-      hub.log({ kind: 'start', who: name, text: `开工：${task.slice(0, 100)}` });
-      hub.update({
-        title: 'AuroraTui · 子代理',
-        team: null,
-        solo: pushSolo({ id, name, role: role || '子代理', task, status: 'running', steps: 0, toolCalls: 0, tokens: {}, cost: 0, startedAt, last: '', events: tr.entries() }),
-      });
-    }
-    const board = hub ? ` · 团队面板 ${hub.url}` : '';
-    ctx?.emit?.({ kind: 'note', text: `子代理「${name}」开工${board}` });
+    pushSolo({ id, name, role: role || '子代理', task, status: 'running', steps: 0, toolCalls: 0, tokens: {}, cost: 0, startedAt, last: '' });
+    ctx?.emit?.({ kind: 'note', text: `子代理「${name}」开工` });
 
     let toolCalls = 0;
     let last = '';
+    let compactions = 0;
     const t0 = Date.now();
     let res;
     try {
@@ -118,8 +136,11 @@ export const subagentTool = {
         cwd: ctx?.cwd || process.cwd(),
         task,
         role,
-        tools: Array.isArray(input.tools) ? input.tools : null,
-        model: String(input.model || ''),
+        // preset 名（scout / readonly / verify）在 resolveToolSet 里展开；这里原样透传
+        tools: rawTools,
+        // 没点名模型时：机械活走 settings.subagentModel（配了就省一大笔）
+        model: String(input.model || cfg.settings?.subagentModel || ''),
+        verify: Array.isArray(input.verify) ? input.verify : input.verify ? [input.verify] : null,
         maxSteps,
         timeoutSec,
         signal: ctx?.signal || null,
@@ -130,36 +151,28 @@ export const subagentTool = {
           if (ev.type === 'tool_start') {
             toolCalls++;
             last = `${ev.name} ${hintOf(ev.input)}`.trim();
-            if (hub) {
-              hub.update({ solo: pushSolo({ id, toolCalls, last, status: 'running', events: tr.entries() }) });
-              hub.log({ kind: 'tool', who: name, text: last });
-            }
-          } else if (ev.type === 'step' && hub) {
-            hub.update({ solo: pushSolo({ id, steps: ev.step, toolCalls, last, status: 'running', events: tr.entries() }) });
-          } else if (ev.type === 'usage' && hub) {
+          } else if (ev.type === 'step') {
+            pushSolo({ id, steps: ev.step, toolCalls, last, status: 'running' });
+          } else if (ev.type === 'compact_end') {
+            compactions++;
+          } else if (ev.type === 'usage') {
             const u = ev.total || {};
-            hub.update({
-              solo: pushSolo({
-                id,
-                steps: u.steps || 0,
-                tokens: { input: u.input || 0, output: u.output || 0 },
-                cost: u.cost || 0,
-                events: tr.entries(),
-              }),
+            pushSolo({
+              id,
+              steps: u.steps || 0,
+              toolCalls,
+              last,
+              status: 'running',
+              tokens: { input: u.input || 0, output: u.output || 0 },
+              cost: u.cost || 0,
             });
-          } else if (hub && (ev.type === 'text' || ev.type === 'reasoning' || ev.type === 'tool_end')) {
-            // 文字流/结果也推走，面板上才能实时长出来
-            hub.update({ solo: pushSolo({ id, events: tr.entries() }) });
           }
         },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       tr.error(`跑挂了：${msg}`);
-      if (hub) {
-        hub.update({ solo: pushSolo({ id, status: 'error', endedAt: Date.now(), last: msg.slice(0, 120), events: tr.entries() }) });
-        hub.log({ kind: 'error', who: name, text: `跑挂了：${msg}` });
-      }
+      pushSolo({ id, status: 'error', endedAt: Date.now(), last: msg.slice(0, 120) });
       return {
         isError: true,
         content: `子代理「${name}」跑挂了（${Math.round((Date.now() - t0) / 1000)}s，${toolCalls} 次工具）：${msg}\n建议：把任务拆小一点，或用更明确的验收标准再派一次。`,
@@ -169,39 +182,35 @@ export const subagentTool = {
 
     const status = res.timedOut ? 'stopped' : res.aborted ? 'stopped' : 'done';
     const tokens = res.usage || {};
+    const rep = res.report || null;
     if (res.text) tr.result(res.text);
     else tr.note('（它没有给出最终答复，可能被中断或步数耗尽）');
-    if (hub) {
-      hub.update({
-        solo: pushSolo({
-          id,
-          status,
-          steps: res.steps,
-          toolCalls,
-          tokens: { input: tokens.input || 0, output: tokens.output || 0 },
-          cost: tokens.cost || 0,
-          endedAt: Date.now(),
-          last,
-          output: res.text,
-          events: tr.entries(),
-        }),
-      });
-      hub.log({
-        kind: status === 'done' ? 'done' : 'note',
-        who: name,
-        text: `${status === 'done' ? '完成' : '已中断'} · ${res.steps} 步 · ${toolCalls} 次工具 · ${(tokens.input || 0) + (tokens.output || 0)} tok`,
-      });
-    }
+    pushSolo({
+      id,
+      status,
+      steps: res.steps,
+      toolCalls,
+      compactions,
+      tokens: { input: tokens.input || 0, output: tokens.output || 0 },
+      cost: tokens.cost || 0,
+      endedAt: Date.now(),
+      last,
+      output: res.text,
+    });
 
     const secs = Math.round((Date.now() - t0) / 1000);
-    const head = `子代理「${name}」${status === 'done' ? '完成' : res.timedOut ? `超时中断（${timeoutSec}s）` : '被中断'}：${res.steps} 步 · ${toolCalls} 次工具 · ${((tokens.input || 0) + (tokens.output || 0)).toLocaleString()} tok · $${(tokens.cost || 0).toFixed(4)} · ${secs}s · 模型 ${res.model}`;
+    const verifyTag = res.verify ? (res.verify.ok ? ' · 验收✓' : ' · 验收✗') : '';
+    const head = `子代理「${name}」${status === 'done' ? '完成' : res.timedOut ? `超时中断（${timeoutSec}s）` : '被中断'}：${res.steps} 步 · ${toolCalls} 次工具 · ${((tokens.input || 0) + (tokens.output || 0)).toLocaleString()} tok · $${(tokens.cost || 0).toFixed(4)} · ${secs}s · 模型 ${res.model}${verifyTag}`;
     const body = res.text ? res.text : '（它没有给出最终答复，可能被中断或步数耗尽）';
+    // 核实账放最后：先给人话，再给硬数据（改了哪些文件、验收到底跑没跑过）
+    const audit = rep ? renderReport(rep) : '';
 
     return {
-      content: `${head}\n\n${body}`,
+      content: `${head}\n\n${body}${audit ? `\n\n${audit}` : ''}`,
       meta: {
         subagent: { name, role, steps: res.steps, toolCalls, tokens, cost: tokens.cost || 0, status, secs, model: res.model },
-        summary: `${name} · ${res.steps} 步 · ${status === 'done' ? '完成' : '中断'}`,
+        report: rep,
+        summary: `${name} · ${res.steps} 步 · ${status === 'done' ? '完成' : '中断'}${verifyTag}`,
       },
     };
   },

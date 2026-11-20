@@ -23,13 +23,14 @@ function usage() {
   auroratui                     打开交互式界面（TUI）
   auroratui "帮我修复这个 bug"    一次性执行并输出（非交互）
   auroratui --continue          恢复上次会话
+  auroratui --acp               ACP 模式，供 OpenIDEA / Zed 等编辑器集成
   auroratui --provider deepseek --model deepseek-flash
   auroratui --cwd <dir>         指定工作目录
   auroratui --plain "..."       强制非交互输出
   auroratui --version | --help
 
 交互界面内:
-  /model 切换模型   /key 配置密钥   /progress 团队面板   /help 全部命令   ESC 中断
+  /model 切换模型   /key 配置密钥   /help 全部命令   ESC 中断
 `);
 }
 
@@ -60,6 +61,14 @@ if (flags.version) {
 if (flags.help) {
   usage();
   process.exit(0);
+}
+
+// ------------------------------------------------------------------- ACP 模式
+// OpenIDEA / Zed 等编辑器的 ACP 集成靠 --acp 拉起本进程：
+// stdout 是 JSON-RPC 通道，任何多余输出都会破坏协议，所以必须最先接管。
+if (flags.acp) {
+  await runAcp();
+  // runAcp 不返回（进程靠 stdin 关闭退出）
 }
 
 const { Config, AGENT_DIR } = await load('src/config.js');
@@ -186,6 +195,44 @@ async function readStdin() {
   const chunks = [];
   for await (const c of process.stdin) chunks.push(c);
   return Buffer.concat(chunks).toString('utf8');
+}
+
+async function runAcp() {
+  // stdout 是 ACP 通道，绝不能混入任何非 JSON-RPC 内容。
+  // 先把可能存在的 console.log 全部改道到 stderr，再启动协议层。
+  const realStdoutWrite = process.stdout.write.bind(process.stdout);
+  const emit = (s, enc, cb) => realStdoutWrite(s, enc, cb);
+
+  // ACP 自己的帧写入走 emit；其余一切 console.* 走 stderr
+  console.log = (...a) => console.error(...a);
+  console.info = (...a) => console.error(...a);
+  console.debug = (...a) => console.error(...a);
+  console.warn = (...a) => console.error(...a);
+
+  // 未捕获异常也不能写到 stdout
+  process.on('uncaughtException', (e) => {
+    console.error('[acp] uncaughtException: ' + (e?.stack || e));
+  });
+  process.on('unhandledRejection', (e) => {
+    console.error('[acp] unhandledRejection: ' + (e?.stack || e));
+  });
+
+  const { serveAcp } = await load('src/acp/agent.js');
+  const agent = serveAcp();
+
+  // 用受控的写入器替换底层输出，确保只有协议层能碰 stdout
+  agent.conn.output = { write: (s) => emit(s) };
+
+  // stdin 关闭（客户端退出）就收工
+  process.stdin.on('end', () => {
+    agent.conn.close();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
+
+  // 保持事件循环
+  await new Promise(() => {});
 }
 
 async function runPlain(text, cwd) {

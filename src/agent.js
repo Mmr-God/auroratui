@@ -14,13 +14,15 @@ const CONTINUE_PROMPT =
   '（上一条回复因单次输出长度上限被截断。请从中断处直接接着写，不要重复已写内容，不要重新开头，也不要解释。）';
 
 export class Agent {
-  constructor({ config, cwd = process.cwd(), session, role = '', tools = null, depth = 0 } = {}) {
+  constructor({ config, cwd = process.cwd(), session, role = '', tools = null, depth = 0, writeScope = null } = {}) {
     this.config = config;
     this.cwd = cwd;
     // 子代理用：role = 角色提示；tools = 受限工具集；depth = 嵌套层数（主代理 0）
     this.role = role;
     this.depth = depth;
     this.tools = Array.isArray(tools) && tools.length ? tools : null;
+    // 团队成员用：只允许写自己负责的文件（fs 工具的 guardWrite 会真的拦下来）
+    this.writeScope = Array.isArray(writeScope) && writeScope.length ? writeScope.map(String) : null;
     // 进度回传：宿主注入一个 push({kind,text}) 之类的回调（TUI 用）
     this.eventSink = null;
     this.sessionId = session?.id || `s${Date.now().toString(36)}`;
@@ -135,10 +137,17 @@ ${todoText ? `## 当前待办（用 todo 工具更新）\n${todoText}\n` : ''}${
 工具: ${caps.join(' / ')}
 ` +
         (st.subagents
-          ? '- `subagent`：把「边界清晰、能独立完成、而且会读一堆文件」的子任务丢给子代理（例：补测试、查报错根因、把 A 模块按 B 接口改造）。任务描述必须自包含：目标、相关路径、约束、验收标准。它在自己的上下文里干活，只把结论带回来，主对话更干净。\n'
+          ? '- `subagent`：把「边界清晰、能独立完成、而且会读一堆文件」的子任务丢给子代理（例：补测试、查报错根因、把 A 模块按 B 接口改造）。任务描述必须自包含：目标、相关路径、约束、验收标准。它在自己的上下文里干活，只把结论带回来，主对话更干净。\n' +
+            '  · **一定要填 `verify`（验收命令）**：它交完活我会亲手跑一遍，失败就自动给它一轮修正，返回值末尾会附一段「核实账」（改了哪些文件、验收跑没跑过、卡在哪）。不填的话它说「测过了」你也无法证伪。\n'
           : '') +
         (st.team
-          ? '- `team`：需要**并行**推进时用。先写清总目标，再给每个成员一个明确角色与只属于他的任务；成员共享同一个工作区，所以要按文件/目录拆开，避免互相覆盖。`team create` 立即返回、成员在后台跑，用 `team status` 看进度、`team wait` 等结果、`team report` 拿每人交代；成员进度能在浏览器团队面板实时看到。\n'
+          ? '- `team`：需要**并行**推进时用。先写清总目标，再给每个成员一个明确角色与只属于他的任务；成员共享同一个工作区，所以要按文件/目录拆开，避免互相覆盖。\n' +
+            '  · **create 时必须填 briefing**：把你这轮已经查清的事实（项目结构、关键文件 path:line、接口约定、构建/测试命令、已知坑）写成要点，成员拿它当已知条件用，才不会各自把项目从零读一遍（那是团队最大的浪费）。\n' +
+            '  · **有先后关系的活用 `depends` 排出依赖**：成员里写 `depends:["接口定稿"]`，他就会等那个人完工再起跑，并自动拿到那人的产出当已知条件。像「先定接口再实现」「先改 schema 再写查询」这类活**必须**这么拆——否则两人同时摸同一个接口，一定打架。互相不依赖的才能真并行。\n' +
+            '  · **一定要填全队 `verify`（验收命令）**：各成员自己的 verify 只验他自己那块；两个人都自测通过、合起来炸（接口不匹配、公共逻辑冲突）只能靠这道全队验收发现，跑完会把失败输出交给你。\n' +
+            '  · 可以用 `budget` 给个成本上限（美元），超出就自动停发新活。成员卡住（反复读同一个文件 / 工具连续失败）时会自动提醒一次，这个不用你管。\n' +
+            '  · `team create` 立即返回、成员在后台并行跑。**返回后不要 team wait 干等**——立刻去做你手上属于队长的那部分（集成、公共文件、验证脚本、文档），或先跑构建/测试。\n' +
+            '  · 看进度用 `team status`（秒回），要汇总用 `team report`（含核实账：改动 / 卡住 / 风险 / 验收 + 全队验收结果）；只有你确实无事可做时才 `team wait`，并给短超时（60-180s）。\n'
           : '') +
         '- 纪律：简单任务自己做更快，别硬拆；用了就说明哪个成员做了什么；成员交回来的东西要自己复核（读回文件 / 跑测试）再向玩家汇报。'
       : `
@@ -168,12 +177,15 @@ ${todoText ? `## 当前待办（用 todo 工具更新）\n${todoText}\n` : ''}${
 1. 先理解再动手：不知道文件在哪先用 glob；不知道符号在哪用 grep；想看结构用 ls；再 read 精读。不要凭猜测编辑文件。复杂取舍先写 think。
    看截图/设计稿/报错图片时，直接用 read 读图片文件（png/jpg/gif/webp/bmp）——图片会附进对话，你能直接看到内容。
 2. 改动要小而准确：修改已有文件优先用 edit（old_string 必须与文件内容逐字符一致，含缩进；多处相同请带上下文或用 edits 批量）；新建文件或多处大改写用 write。
+   要用 edit 反复碰壁时（old_string 不唯一、缩进对不上、分散在多处的改动），改用 **patch** 工具喂 unified diff：一次可以改多个文件多个位置，而且要么全成要么全不动。
 3. 小步验证：改完代码后运行相关测试、构建或最小复现命令验证；失败时读报错、修正、重跑，不要空口宣称成功。
+   改完一批文件先用 **diagnostics** 跑一遍静态检查（自动挑 tsc/eslint/go vet/ruff/cargo），它直接告诉你「文件:行:列 什么错」，比肉眼看几百行 stdout 靠谱；要跑测试用 shell。
 4. 绝不臆造：命令输出、文件内容、API 结果都必须来自真实工具返回。不确定就查（web_search / web_fetch）。
+   长命令别硬卡：起 dev server、watch 模式、十几分钟的构建，用 shell 的 background=true，拿到 jobId 后先干别的，回头用 jobs 的 tail 看输出；收工前记得 jobs kill，否则下一条前台命令会排队等它。
 5. 危险操作（删除大量文件、git push --force、安装全局包）先说明理由；除非用户要求，不要提交 git。
 6. 需要最新信息、库文档、报错原因时用 web_search，再用 web_fetch 读正文；引用了网页请在回答里给出链接。
 7. 上下文很长时系统会自动压缩早期历史成 <compressed_history> 块。需要早前细节时用 context 工具: search → expand。
-7.5 需要 JS 渲染的页面、或 web_fetch 拿到空白内容时，改用 browser（action=open 取正文，action=screenshot 看画面）。
+7.5 web_fetch 拿到空白页（页面靠 JS 渲染）时，改用 http_request 直接打它后端接口；实在拿不到就让玩家自己贴内容，不要臆造。
 7.6 如果系统提示里列出了相关技能，先用 skill load 读该技能再动手，按里面的步骤与约定执行。
 7.7 拿不准用户想要什么时，别猜：用 ask 工具问（2-5 个具体选项；多个方案可同时选时设 multi=true）。典型场景：有多种合理改法、要动/删别人的文件、信息缺失（路径、库、风格）、改动范围不清楚。一次只问一件事，问完按玩家的选择继续；玩家自己输入的答案优先于选项。
 7.8 要画图（图标、像素画、素材、贴图）且没有图像生成模型时，用 draw 工具：输出绘图 op，PNG 会直接附在工具结果里让你亲眼看见，然后反复 画→看→改。细节见 skill load draw。
@@ -207,6 +219,8 @@ ${todoText ? `## 当前待办（用 todo 工具更新）\n${todoText}\n` : ''}${
       // 子代理：嵌套层数 + 允许的工具集（runTool 会拦越权调用）
       depth: this.depth || 0,
       allowedTools: this.tools ? new Set(this.tools.map((x) => x.name)) : null,
+      // 团队成员的文件范围（fs 工具写保护用）
+      writeScope: this.writeScope,
       // 子代理 / 团队工具把进度推到界面上
       emit: (item) => {
         try {
@@ -215,7 +229,7 @@ ${todoText ? `## 当前待办（用 todo 工具更新）\n${todoText}\n` : ''}${
           /* 界面出错不影响干活 */
         }
       },
-      // 让工具能感知用户按了 ESC（长命令/爬网页/浏览器自动化能及时收尾）
+      // 让工具能感知用户按了 ESC（长命令/爬网页能及时收尾）
       signal: this.abort?.signal,
       ask: this.askHandler ? (payload) => this.askHandler(payload) : null,
     };
@@ -228,6 +242,8 @@ ${todoText ? `## 当前待办（用 todo 工具更新）\n${todoText}\n` : ''}${
     this.applyEngineLimits(t0);
     this.engine.addUser(text);
     this.busy = true;
+    // 玩家的话已经进上下文了：先通知宿主落盘，中途崩溃 / 断电也不会丢这一轮
+    yield { type: 'turn_start' };
     const controller = new AbortController();
     this.abort = controller;
     const onAbort = () => controller.abort();

@@ -49,6 +49,14 @@ t.chip = (s) => `\x1b[48;5;238m\x1b[38;5;252m ${s} \x1b[0m`;
 t.badge = (s, bg = 131, fg = 255) => `\x1b[48;5;${bg}m\x1b[38;5;${fg}m ${s} \x1b[0m`;
 t.plain = (s) => `\x1b[38;5;252m${s}\x1b[0m`;
 
+// 团队成员的标识色（和主代理的蓝 111 明显区分开）。
+// 按成员序号轮转，一眼就能分清「这是谁在调工具」。
+const MEMBER_COLORS = [141, 179, 114, 210, 152, 217, 184, 109, 216, 150];
+/** 第 n 个成员的颜色函数（0-based；TUI 里和主代理的 accent 蓝区分）。 */
+t.member = (n) => fg256(MEMBER_COLORS[Math.abs(Number(n) || 0) % MEMBER_COLORS.length]);
+/** 成员颜色代码（有些地方要拿裸色号拼背景）。 */
+export const memberColorCode = (n) => MEMBER_COLORS[Math.abs(Number(n) || 0) % MEMBER_COLORS.length];
+
 export const T = t;
 
 export const glyphs = {

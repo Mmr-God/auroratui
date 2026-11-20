@@ -23,6 +23,7 @@ import {
   strWidth,
   padToWidth,
   truncToWidth,
+  truncLeft,
   wrapWords,
   charWidth,
   fmtNum,
@@ -36,24 +37,31 @@ import {
   estimateTokens,
 } from '../util.js';
 import { SESSIONS_DIR, AGENT_DIR } from '../config.js';
-import { readClipboard, writeClipboard, readClipboardImage, quotePath } from './clipboard.js';
+import { readClipboard, writeClipboard, readClipboardImage, readClipboardAny, quotePath } from './clipboard.js';
+import { SessionStatus, readAllStatuses, sweep, dotOf, STATES } from '../backend/status.js';
 import { Checkpoints } from '../checkpoint.js';
 import { listSkills } from '../tools/skill.js';
-import { ensureHub, resetHub, openInBrowser } from '../progress.js';
 import { getActiveTeam, lastTeamSnapshot } from '../team.js';
 import { describeTool } from './toolview.js';
 import { disposeShell } from '../tools/shell.js';
+import { jobs } from '../jobs.js';
 import { describeHooks } from '../tools/hooks.js';
-import { findBrowser } from '../tools/browser.js';
 
 const VERSION = '2.1.0';
 const APP_NAME = 'AuroraTui';
+
+// 会话条目上限：老条目真删。
+// 长会话里工具块是最能堆的（一次任务几十条 × 每条带全部输出 + 渲染缓存），
+// 它们滚出屏幕后永远看不到了，留着纯粹是内存泄漏。400 条对回看历史绰绰有余。
+const MAX_ITEMS = 400;
+// 单条渲染缓存超过这么多行就不缓存（否则一坨 5 万行的输出会把自己钉在内存里）
+const MAX_CACHED_LINES = 2000;
 
 const WELCOME = [
   `${T.accentBold('◆ ' + APP_NAME)} ${T.dimmer('· 终端里的 AI 编程代理')}`,
   '',
   `${T.dim('基础')}  ${T.text('read')} ${T.dimmer('·')} ${T.text('write')} ${T.dimmer('·')} ${T.text('edit')} ${T.dimmer('·')} ${T.text('shell')}`,
-  `${T.dim('进阶')}  ${T.text('glob')} ${T.dimmer('·')} ${T.text('grep')} ${T.dimmer('·')} ${T.text('ls')} ${T.dimmer('·')} ${T.text('think')} ${T.dimmer('·')} ${T.text('ask')} ${T.dimmer('·')} ${T.text('web_search')} ${T.dimmer('·')} ${T.text('web_fetch')} ${T.dimmer('·')} ${T.text('browser')} ${T.dimmer('·')} ${T.text('http_request')}`,
+  `${T.dim('进阶')}  ${T.text('glob')} ${T.dimmer('·')} ${T.text('grep')} ${T.dimmer('·')} ${T.text('ls')} ${T.dimmer('·')} ${T.text('think')} ${T.dimmer('·')} ${T.text('ask')} ${T.dimmer('·')} ${T.text('web_search')} ${T.dimmer('·')} ${T.text('web_fetch')} ${T.dimmer('·')} ${T.text('http_request')}`,
   `${T.dim('记忆')}  ${T.text('todo')} ${T.dimmer('·')} ${T.text('memory')} ${T.dimmer('·')} ${T.text('skill')} ${T.dimmer('·')} ${T.text('git')} ${T.dimmer('·')} ${T.text('context')} ${T.dimmer('（billion-context）')}`,
   `${T.dim('命令')}  ${T.text('/model')} ${T.dimmer('切换模型  ')}${T.text('/history')} ${T.dimmer('历史对话  ')}${T.text('/trust')} ${T.dimmer('全权模式  ')}${T.text('/help')} ${T.dimmer('全部命令')}`,
   `${T.dim('鼠标')}  ${T.dimmer('拖选复制 ')}${T.dimmer('·')} ${T.dimmer('右键/Ctrl+V 粘贴 ')}${T.dimmer('·')} ${T.dimmer('滚轮滚动 ')}${T.dimmer('·')} ${T.dimmer('点块头折叠')}`,
@@ -104,16 +112,16 @@ const COMMANDS = [
   { name: '/tools', args: '', desc: '工具清单' },
   { name: '/subagents', args: '[on|off]', desc: '子代理开关（AI 可派生助手）' },
   { name: '/team', args: '[on|off]', desc: '团队协作开关（AI 可组队并行）' },
-  { name: '/progress', args: '[open]', desc: '团队面板（浏览器看进度）' },
-  { name: '/shell', args: '[open]', desc: 'Shell 后端（看/终止 AI 跑过的命令）' },
-  { name: '/spawn', args: '', desc: '在浏览器里手动组队/派子代理' },
+  { name: '/teamPanel', args: '', desc: '打开团队成员面板（选成员看他的会话，return 回主对话）' },
+  { name: '/teamShow', args: '[on|off]', desc: '主界面下方显示团队成员的实时工具调用' },
+  { name: '/shellManager', args: '', desc: 'Shell 任务管理：看每条命令、实时输出、退出码，能终止和清空（return 回主对话）' },
   { name: '/queue', args: '[clear|drop n]', desc: '待发队列（AI 干活时 Tab 排队；Enter 直接插话）' },
   { name: '/todo', args: '[list|set|clear]', desc: '查看/维护待办' },
   { name: '/memory', args: '[list|set|forget]', desc: '查看/维护长期记忆' },
   { name: '/verbose', args: '', desc: '工具输出预览 详细/精简' },
   { name: '/sessions', args: '', desc: '已保存会话' },
   { name: '/resume', args: '<n>', desc: '恢复会话' },
-  { name: '/history', args: '[筛选]', desc: '历史对话（选择后恢复）' },
+  { name: '/history', args: '[筛选]', desc: '历史对话（← ↑↓ 选择 · Enter 恢复 · r 改名 · d 删除）' },
   { name: '/trust', args: '[on|off]', desc: '全权模式（可改工作区外文件）' },
   { name: '/undo', args: '[n]', desc: '回滚上一次文件改动' },
   { name: '/paste', args: '', desc: '从系统剪贴板粘贴（图片则填入图片路径）' },
@@ -139,13 +147,13 @@ const HELP = [
   '/tools               查看工具清单',
   '/subagents [on|off]  子代理：允许 AI 派独立上下文的助手干活（默认关，会多花 token）',
   '/team [on|off]       团队协作：允许 AI 组队并行开发（默认关，token 消耗成倍）',
-  '/progress [open]     打开团队面板（浏览器看子代理/团队成员实时进度）',
-  '/shell [open]        Shell 后端：AI 跑过的每条命令、实时输出、手动终止',
-  '/spawn               在浏览器里手动组队或派一个子代理（玩家亲自开工）',
+  '/teamPanel           团队成员面板：选一个成员看他的完整会话（工具输出、思考、上下文），输入 return 回主对话',
+  '/teamShow [on|off]   主界面下方显示「Team: 成员A/B 正在调用 xx 工具」（颜色区分成员；思考时不显示）',
+  '/shellManager        Shell 任务管理：↑↓ 选命令 · Enter 看完整输出 · Ctrl+K 终止 · Ctrl+D 清空历史 · 输 return 回主对话',
   '/queue [clear|drop n] 待发队列：AI 干活时按 Tab 排队，收工后自动发送（最多 5 条）；直接 Enter 是插话，当前步骤结束后生效',
   '/verbose             切换工具输出预览（详细/精简）',
   '/sessions            查看已保存会话     /resume <n>  恢复',
-  '/history             历史对话列表（↑↓ 选择，Enter 恢复）',
+  '/history             历史对话列表（↑↓ 选择，Enter 恢复，r 改名，d 删除，直接打字筛选）',
   '/trust [on|off]      全权模式：允许读写工作区之外的文件（默认关闭）',
   '/undo [n]            回滚写文件前的自动快照（checkpoint）',
   '/paste               从系统剪贴板粘贴到输入框（也可 Ctrl+V / 右键）',
@@ -217,38 +225,32 @@ export class App {
     this.selFlash = 0; // 高亮闪烁计数，复制后短暂高亮
     this.nativeMouse = false;
     this.histOverlay = null; // {items:[], sel:0, filter:''}
+    this.histHits = null; // 历史面板的鼠标命中区（composeHistoryOverlay 每帧重算）
     this.lastFrameRaw = [];
     this.lastFrameH = 20;
     this.checkpoints = new Checkpoints(path.join(AGENT_DIR, 'checkpoints', stamp()));
     this.agent.checkpoints = this.checkpoints;
+    /** 当前活跃团队（成员实时工具行用；由事件 / 命令刷新） */
+    this.activeTeam = getActiveTeam();
+    /**
+     * 跨进程状态停靠：让**别的进程 / 别的窗口**也能知道这个会话在干什么。
+     * 关键点是它不依赖本进程活着 —— 判定靠心跳（见 src/backend/status.js）。
+     */
+    this.status = new SessionStatus({
+      sessionId: this.agent.sessionId,
+      // 标题 / 工作区都延迟求值：会话标题可能后改，切了目录也要跟上
+      title: () => this.title || this.taskTitle || '新会话',
+      cwd: () => this.cwd,
+    });
+    // 历史面板用的状态快照（每帧刷新一次，不在渲染里反复读盘）
+    this.sessionStates = new Map();
+    this._statesAt = 0;
     this.bindAgent();
     this.done = new Promise((r) => (this._done = r));
     if (resume) this.loadLatestSession();
   }
 
   // ------------------------------------------------------------- lifecycle
-  /** 面板起来后，把「浏览器手动开工」接到 spawnFromBrowser。 */
-  bindSpawn(hub = null) {
-    const attach = (h) => {
-      if (!h) return;
-      h.onSpawn = async (payload) => {
-        const { spawnFromBrowser } = await import('../spawn.js');
-        return spawnFromBrowser(
-          {
-            config: this.config,
-            cwd: this.cwd,
-            checkpoints: this.checkpoints,
-            emit: (item) => this.push(item),
-          },
-          payload,
-        );
-      };
-    };
-    if (hub) return attach(hub);
-    ensureHub(this.config).then(attach).catch(() => {});
-    return undefined;
-  }
-
   async start() {
     const out = process.stdout;
     if (!out.isTTY) {
@@ -291,7 +293,6 @@ export class App {
     out.on('resize', this.onResize);
 
     this.pushWelcome();
-    this.bindSpawn();
     this.render(true);
     // console size sometimes settles a moment after the window is created
     setTimeout(() => {
@@ -311,6 +312,12 @@ export class App {
         // 运行中不再每 33ms 全屏重绘（30fps 的全屏重画会打断输入法组合串，
         // 键盘事件也会被压在重绘后面），计时数字 100ms 刷一次足够
         if (this._ticks % 3 === 0 && Date.now() - (this.lastInputAt || 0) > 120) this.dirty = true;
+      } else if (this._teamTicking()) {
+        // 团队还在后台跑（主代理可能已经收工）：成员工具行 / 器时秒数要动
+        if (this._ticks % 12 === 0) this.dirty = true;
+      } else if (this.shellPanel && this._ticks % 6 === 0) {
+        // shell 面板开着：命令还在跑时，实时尾巴和耗时得跟着动
+        this.dirty = true;
       }
       if (this.dirty && !(this.running && Date.now() - (this.lastInputAt || 0) < 120)) this.render();
     }, 33);
@@ -451,8 +458,45 @@ export class App {
       this.scroll = 0;
       this.followAnchor = null;
     }
+    this.trimTranscript();
     this.dirty = true;
     return item;
+  }
+
+  /**
+   * 老条目必须真删，不能只是不画。
+   *
+   * 以前 items 永不上限：一次长会话几千条工具块 × 每条带着完整输出 + 渲染缓存，
+   * 堆起来就是几百 MB 常驻内存（实测单个 agent 进程 814MB）。它们在屏幕外永远
+   * 不会再被看到，没有任何理由留着。
+   *
+   * 阈值按「条目数」和「渲染缓存行数」双控：一坨超长输出也能把缓存吃满。
+   */
+  trimTranscript() {
+    const n = this.items.length;
+    if (n <= MAX_ITEMS) return false;
+    // 保留最近 MAX_ITEMS 条；切点要是 user/assistant 这类「块边界」，
+    // 否则会从半个工具块中间断开（看着像坏了）。
+    let cut = n - MAX_ITEMS;
+    const boundary = (it) => it && (it.kind === 'user' || it.kind === 'assistant' || it.kind === 'banner');
+    for (let i = cut; i < n - 4; i++) {
+      if (boundary(this.items[i])) {
+        cut = i;
+        break;
+      }
+    }
+    if (cut <= 0) return false;
+    const dropped = this.items.splice(0, cut);
+    // 被丢掉的条目把缓存一起释放（splice 只是从数组里拿掉，对象还活着就只能等 GC）
+    for (const it of dropped) {
+      it._cache = null;
+      it.content = '';
+      it.text = '';
+      it.input = null;
+      it.meta = null;
+    }
+    this._itemSpans = null;
+    return true;
   }
 
   pushWelcome() {
@@ -582,8 +626,10 @@ export class App {
     const status = this.statusBarLine(W);
     const popup = this.compPopupLines(W);
     const hint = this.argHintLines(W);
-    const extra = popup.length + hint.length;
-    const transcriptH = Math.max(3, H - 1 - box.length - 1 - extra);
+    // 团队成员实时工具行（/teamShow 开 + 有成员正在调工具时才占位置；思考中不显示）
+    const teamRow = this.teamLiveLines(W);
+    const extra = popup.length + hint.length + teamRow.length;
+    const transcriptH = Math.max(3, H - 1 - box.length - 1 - teamRow.length - popup.length - hint.length);
     const tlines = this.transcriptLines(W);
 
     const total = tlines.length;
@@ -612,6 +658,7 @@ export class App {
       .map((sp) => ({ from: 2 + (sp.start - start), to: 2 + (sp.end - start), item: sp.item }));
     this.viewInfo = { total, start, end, viewH: transcriptH };
     if (total > transcriptH) this.drawScrollbar(rows, W, transcriptH, total, start);
+    if (teamRow.length) rows.push(...teamRow);
     if (hint.length) rows.push(...hint);
     if (popup.length) rows.push(...popup);
     rows.push(...box);
@@ -619,6 +666,8 @@ export class App {
     if (this.picker) this.composeOverlay(rows, W, H, 1, transcriptH);
     if (this.histOverlay) this.composeHistoryOverlay(rows, W, H, transcriptH);
     if (this.askState) this.composeAskOverlay(rows, W, H, transcriptH);
+    if (this.teamPanel) this.composeTeamPanel(rows, W, H, transcriptH);
+    if (this.shellPanel) this.composeShellPanel(rows, W, H, transcriptH);
     this.cursorPos = this.computeCursor(W, rows.length, transcriptH, box);
     const raw = rows.slice(0, H);
     this.lastFrameRaw = raw;
@@ -646,6 +695,39 @@ export class App {
       rows[idx] = padToWidth(truncToWidth(rows[idx] || '', W - 1), W - 1) + glyph;
     }
     this.sbInfo = { viewH, total, maxScroll, thumbH, pos };
+  }
+
+  /** 团队是否还在后台干活（决定要不要继续小刷新，让成员行 / 秒数跳动） */
+  _teamTicking() {
+    const t = this.activeTeam || getActiveTeam();
+    return !!t?.running;
+  }
+
+  /**
+   * 团队成员实时工具行（一行，挤在输入框上方）。
+   * 规则（按玩家要求）：
+   *   · /teamShow 关了 → 完全不出现（不占行）
+   *   · 成员在「思考」→ 不出现（思考不可见，避免刷屏）
+   *   · 只显示**正在调工具**的成员，每人一个彩色小段，颜色按成员区分（和主代理的蓝不同）
+   */
+  teamLiveLines(W) {
+    if (this.config.settings.teamShow === false) return [];
+    const team = this.activeTeam && this.activeTeam.running ? this.activeTeam : null;
+    if (!team) return [];
+    const live = team.liveState();
+    if (!live.length) return [];
+    const palette = (i) => T.member(team.members.findIndex((m) => m.id === live[i].id));
+    const parts = [];
+    for (let i = 0; i < live.length; i++) {
+      const row = live[i];
+      const col = palette(i);
+      const hint = row.hint ? ` ${T.dimmer(truncToWidth(row.hint, 28))}` : '';
+      const secs = row.secs >= 2 ? T.dimmer(` ${row.secs}s`) : '';
+      parts.push(`${col(row.name)}${T.dimmer(':')}${col(row.tool)}${hint}${secs}`);
+    }
+    const head = ` ${T.dimmer('Team')} `;
+    const line = head + parts.join(T.dimmer('  ·  '));
+    return [padToWidth(truncToWidth(line, W - 1), W - 1)];
   }
 
   /** 滚动条拖动 / 点击轨道：把 y 映射回 scroll 值。 */
@@ -1192,35 +1274,36 @@ export class App {
   }
 
   async pasteFromClipboard() {
-    const res = await readClipboard();
-    let text = (res.text || '').replace(/\r?\n/g, '\n').replace(/\t/g, '  ');
+    // 不管剪贴板里是文字、文件、截图还是别的格式，readClipboardAny 都会给出
+    // 「能拼进输入框的东西」：文字就贴原文，其余一律贴路径（模型用 read 拿）。
+    const r = await readClipboardAny();
+    if (r.kind !== 'text') {
+      if (!r.ok) {
+        this.push({ kind: 'warn', text: `粘贴失败：${r.err || '剪贴板不可用'}（可用 /native 开原生鼠标，再用终端自带的粘贴）` });
+        this.dirty = true;
+        return this.render(true);
+      }
+      const paths = String(r.text || '').trim();
+      if (!paths) {
+        this.push({ kind: 'note', text: '剪贴板是空的（文本 / 文件 / 图片都没读到）', inline: true });
+        this.dirty = true;
+        return this.render(true);
+      }
+      if (this.running) {
+        this.agent.queue(paths);
+        this.push({ kind: 'note', text: `${r.note || '已粘贴路径'}，已插话（当前步骤结束后生效）`, inline: true });
+        this.dirty = true;
+        return this.render(true);
+      }
+      this.insertText(paths);
+      this.push({ kind: 'note', text: `${r.note || '已粘贴路径'}：${paths}`, inline: true });
+      this.dirty = true;
+      return this.render(true);
+    }
+
+    let text = (r.text || '').replace(/\r?\n/g, '\n').replace(/\t/g, '  ');
     if (!text.trim()) {
-      // 剪贴板里是截图？终端画不出图片，就把图片存成临时 PNG、把路径填进输入框，
-      // 发送后模型用 read 工具就能看到这张图。
-      const img = await readClipboardImage();
-      if (img.ok) {
-        const paths = (img.paths && img.paths.length ? img.paths : [img.path]).map(quotePath).join(' ');
-        if (this.running) {
-          this.agent.queue(paths);
-          this.push({ kind: 'note', text: `剪贴板里是图片，已插话图片路径（当前步骤结束后生效）`, inline: true });
-          this.dirty = true;
-          return this.render(true);
-        }
-        this.insertText(paths);
-        this.push({
-          kind: 'note',
-          text: `剪贴板里是图片，已存成 ${img.path} 并填入输入框（回车发送，我就能看图）`,
-          inline: true,
-        });
-        this.dirty = true;
-        return this.render(true);
-      }
-      if (!res.ok) {
-        this.push({ kind: 'warn', text: `读取剪贴板失败：${res.err || '剪贴板不可用'}（可用 /native 开原生鼠标，再用终端自带的粘贴）` });
-        this.dirty = true;
-        return this.render(true);
-      }
-      this.push({ kind: 'note', text: '剪贴板是空的（文本和图片都没读到）', inline: true });
+      this.push({ kind: 'note', text: '剪贴板是空的（文本 / 文件 / 图片都没读到）', inline: true });
       this.dirty = true;
       return this.render(true);
     }
@@ -1277,15 +1360,57 @@ export class App {
   }
 
   openHistory(filter = '') {
+    // 先把当前对话落盘，否则刚聊完的会话不在列表里
+    this.saveSession();
     const list = this.listSessions();
     if (!list.length) {
-      this.push({ kind: 'note', text: '还没有历史会话（每轮结束会自动保存到 ~/.agent/sessions）' });
+      this.push({ kind: 'note', text: '还没有历史会话（发第一句话时就会保存到 ~/.agent/sessions）' });
       this.dirty = true;
       return this.render(true);
     }
-    this.histOverlay = { items: list, sel: 0, offset: 0, filter: String(filter || '') };
+    this.histOverlay = { items: list, sel: 0, offset: 0, filter: String(filter || ''), rename: null };
     this.dirty = true;
     this.render(true);
+  }
+
+  /**
+   * 一个会话在列表里占的行：标题按可用宽度自动换行（最多 3 行），
+   * 第二行固定给工作区目录（太长从左边省略，保证尾部可见），
+   * 模型 / 条数放得下就跟在同一行，放不下另起一行。
+   */
+  histItemLines(s, width) {
+    const w = Math.max(10, Math.floor(width));
+    const stampW = 7;
+    const indent = ' '.repeat(stampW + 1);
+    const titleW = Math.max(8, w - stampW - 1);
+    const raw = String(s.title || '(无标题)').replace(/\s+/g, ' ').trim() || '(无标题)';
+    const wrapped = wrapWords(raw, titleW).filter((x) => stripAnsi(x).trim() !== '');
+    const maxTitleLines = 3;
+    const titleLines = (wrapped.length ? wrapped : ['(无标题)']).slice(0, maxTitleLines);
+    if (wrapped.length > maxTitleLines) {
+      const i = maxTitleLines - 1;
+      titleLines[i] = truncToWidth(stripAnsi(titleLines[i]).replace(/\s+$/, '') + '…', titleW);
+    }
+    const out = [];
+    titleLines.forEach((ln, i) => {
+      // 置顶标记：只在第一行标题的最前面加一个针脚（不占额外行）
+      const pin = i === 0 && s.pinned ? `${T.accent2('★')} ` : '';
+      const head = i === 0 ? `${T.dimmer(timeAgo(s.updated).padEnd(stampW))} ` : indent;
+      out.push(truncToWidth(head + pin + T.white(ln), w));
+    });
+    const dir = s.cwd ? prettyCwd(s.cwd) : '(未知工作区)';
+    const cur = !!(s.id && this.agent && s.id === this.agent.sessionId);
+    const extra = [cur ? '当前会话' : '', s.model ? String(s.model) : '', s.msgs ? `${s.msgs} 条` : ''].filter(Boolean).join(' · ');
+    const dirRoom = Math.max(8, w - stampW - 3); // 「⌂ 」+ 缩进
+    const extraW = strWidth(extra);
+    if (extra && extraW + 16 <= dirRoom) {
+      const dirBudget = Math.max(8, dirRoom - extraW - 2);
+      out.push(`${indent}${T.accent2('⌂')} ${T.dim(truncLeft(dir, dirBudget))}  ${T.dimmer(extra)}`);
+    } else {
+      out.push(`${indent}${T.accent2('⌂')} ${T.dim(truncLeft(dir, dirRoom))}`);
+      if (extra) out.push(`${indent}${T.dimmer(truncToWidth(extra, dirRoom))}`);
+    }
+    return out.map((ln) => truncToWidth(ln, w));
   }
 
   handleHistoryKey(ev) {
@@ -1293,18 +1418,66 @@ export class App {
     const k = ev.key;
     const list = this.filterHistItems();
     this.dirty = true;
-    if (k === 'esc') {
+    // 改名模式：吃掉所有按键，别让筛选/选择抢走输入
+    if (h.rename != null) {
+      if (k === 'esc' || k === 'ctrl+c') {
+        h.rename = null;
+        return;
+      }
+      if (k === 'enter') return this.commitHistRename();
+      if (k === 'backspace') {
+        h.rename = h.rename.slice(0, -1);
+        return;
+      }
+      if (k === 'ctrl+u') {
+        h.rename = '';
+        return;
+      }
+      if (k === 'space') {
+        h.rename += ' ';
+        return;
+      }
+      if (k === 'paste') {
+        h.rename += String(ev.text || '').replace(/\s+/g, ' ');
+        return;
+      }
+      if (k === 'text') {
+        h.rename += ev.text;
+        this.lastInputAt = Date.now();
+        return;
+      }
+      return;
+    }
+    if (k === 'esc' || k === 'ctrl+c') {
       this.histOverlay = null;
       return;
     }
-    if (k === 'up' || k === 'ctrl+p' || k === 'shift-tab') {
-      h.sel = (h.sel - 1 + list.length) % Math.max(1, list.length);
+    const typeFilter = (ch) => {
+      h.filter += ch;
+      h.sel = 0;
+      h.offset = 0;
+    };
+    if (!list.length) {
+      if (k === 'backspace') {
+        h.filter = h.filter.slice(0, -1);
+        h.sel = 0;
+        h.offset = 0;
+      } else if (k === 'text' || k === 'space') {
+        typeFilter(k === 'space' ? ' ' : ev.text);
+      }
       return;
     }
-    if (k === 'down' || k === 'ctrl+n' || k === 'tab') {
-      h.sel = (h.sel + 1) % Math.max(1, list.length);
-      return;
-    }
+    h.sel = clamp(h.sel, 0, list.length - 1);
+    const moveTo = (n) => {
+      h.sel = clamp(n, 0, list.length - 1);
+      if (h.sel < (h.offset || 0)) h.offset = h.sel;
+    };
+    if (k === 'up' || k === 'ctrl+p' || k === 'shift-tab' || k === 'wheel-up') return moveTo(h.sel - 1);
+    if (k === 'down' || k === 'ctrl+n' || k === 'tab' || k === 'wheel-down') return moveTo(h.sel + 1);
+    if (k === 'pageup') return moveTo(h.sel - 5);
+    if (k === 'pagedown') return moveTo(h.sel + 5);
+    if (k === 'home') return moveTo(0);
+    if (k === 'end') return moveTo(list.length - 1);
     if (k === 'enter') {
       const it = list[h.sel];
       if (!it) return;
@@ -1312,75 +1485,266 @@ export class App {
       this.loadSessionFile(it.file);
       return;
     }
-    if (k === 'd' || k === 'delete') {
+    if (h.pendingDelete) {
+      h.pendingDelete = false;
+      const yes = k === 'ctrl+d' || k === 'delete' || k === 'enter' || k === 'y' || (k === 'text' && /^[yY]$/.test(ev.text || ''));
+      if (yes) {
+        const it = list[h.sel];
+        if (!it) return;
+        try {
+          fs.unlinkSync(it.file);
+        } catch {}
+        h.items = this.listSessions();
+        h.sel = clamp(h.sel, 0, Math.max(0, h.items.length - 1));
+        h.offset = clamp(h.offset || 0, 0, Math.max(0, h.items.length - 1));
+        this.push({ kind: 'note', ephemeral: true, inline: true, text: `已删除会话：${it.title}` });
+        return;
+      }
+    }
+    if (k === 'ctrl+r') {
       const it = list[h.sel];
       if (!it) return;
-      try {
-        fs.unlinkSync(it.file);
-      } catch {}
-      h.items = this.listSessions();
-      h.sel = clamp(h.sel, 0, Math.max(0, h.items.length - 1));
+      h.rename = String(it.title || '');
+      return;
+    }
+    // 置顶 / 取消置顶：p 是 mnemonic（pin）。置顶后它会被排到列表前面，
+    // 所以切换完要把选中项跟着那一行走，否则按完 p 光标会突然跳到别的会话上。
+    if (k === 'p') {
+      return this.togglePinSelected();
+    }
+    if (k === 'mouse-down') {
+      return this.clickHistory(ev);
+    }
+    if (/^(mouse|wheel)/.test(k)) return;
+    if (k === 'ctrl+d' || k === 'delete') {
+      // 删会话不可恢复：先按一次提示，再按一次才真删
+      if (list[h.sel]) h.pendingDelete = true;
       return;
     }
     if (k === 'backspace') {
       h.filter = h.filter.slice(0, -1);
       h.sel = 0;
+      h.offset = 0;
       return;
     }
     if (k === 'text' || k === 'space') {
-      h.filter += k === 'space' ? ' ' : ev.text;
-      h.sel = 0;
+      typeFilter(k === 'space' ? ' ' : ev.text);
+    }
+  }
+
+  /** 只改会话文件里的标题；如果改的是当前会话，界面标题也一起更新。 */
+  renameSession(file, title) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      data.title = title;
+      data.updated = Date.now();
+      fs.writeFileSync(file, JSON.stringify(data, null, 1));
+      if (data.id && data.id === this.agent.sessionId) this.title = title;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  commitHistRename() {
+    const h = this.histOverlay;
+    const list = this.filterHistItems();
+    const it = list[h.sel];
+    const title = String(h.rename || '').replace(/\s+/g, ' ').trim();
+    h.rename = null;
+    if (!it || !title) return;
+    if (!this.renameSession(it.file, title)) {
+      this.push({ kind: 'warn', text: '改名失败：读不到会话文件' });
       return;
     }
-    if (k === 'ctrl+c') {
-      this.histOverlay = null;
+    h.items = this.listSessions();
+    const idx = h.items.findIndex((s) => s.file === it.file);
+    h.sel = idx < 0 ? 0 : idx;
+    h.offset = Math.min(h.offset || 0, Math.max(0, h.items.length - 1));
+    this.push({ kind: 'note', text: `会话标题已改为：${title}`, inline: true });
+  }
+
+  /** 切换当前选中会话的置顶状态，并让选中项跟着那一行走。 */
+  togglePinSelected() {
+    const h = this.histOverlay;
+    if (!h) return;
+    const list = this.filterHistItems();
+    const it = list[h.sel];
+    if (!it) return;
+    const next = this.togglePinSession(it.file);
+    if (next === null) {
+      this.push({ kind: 'warn', text: '置顶失败：读不到会话文件' });
+      return;
     }
+    h.items = this.listSessions();
+    const idx = h.items.findIndex((s) => s.file === it.file);
+    h.sel = idx < 0 ? 0 : idx;
+    h.offset = Math.min(h.offset || 0, Math.max(0, h.items.length - 1));
+    this.push({
+      kind: 'note',
+      ephemeral: true,
+      inline: true,
+      text: next ? `已置顶：${it.title}` : `已取消置顶：${it.title}`,
+    });
+  }
+
+  /**
+   * 历史面板里的鼠标：右键 = 置顶/取消置顶（和输入框右键粘贴不冲突——面板打开时
+   * 右键属于面板）。左键点上下半区是翻选，点中间选中那一项 = 直接恢复。
+   */
+  clickHistory(ev) {
+    const h = this.histOverlay;
+    if (!h) return;
+    if (ev.button === 2) {
+      const list = this.filterHistItems();
+      const row = this.histRowAt(ev.x, ev.y);
+      if (row != null) h.sel = row;
+      void list;
+      return this.togglePinSelected();
+    }
+    if (ev.button !== 0) return;
+    const row = this.histRowAt(ev.x, ev.y);
+    if (row == null) return;
+    const list = this.filterHistItems();
+    if (row === h.sel && list[row]) {
+      // 点已选中的项 = 恢复这个会话
+      this.histOverlay = null;
+      this.loadSessionFile(list[row].file);
+      return;
+    }
+    h.sel = row;
+  }
+
+  /** 鼠标 y 坐标 → 历史列表里的第几项（不在列表区域返回 null）。 */
+  histRowAt(x, y) {
+    const h = this.histOverlay;
+    const hits = this.histHits;
+    if (!h || !hits || !hits.rows) return null;
+    if (x < hits.x0 || x > hits.x1) return null;
+    for (const r of hits.rows) {
+      if (y === r.y) return r.idx;
+    }
+    return null;
   }
 
   composeHistoryOverlay(frame, W, H, transcriptH) {
     const h = this.histOverlay;
     const list = this.filterHistItems();
-    const boxW = Math.min(W - 4, 88);
-    const inner = boxW - 4;
-    const maxRows = Math.max(8, transcriptH + 2);
-    const visible = Math.max(1, Math.min(maxRows - 4, list.length || 1));
-    if (h.sel < (h.offset || 0)) h.offset = h.sel;
-    if (h.sel >= (h.offset || 0) + visible) h.offset = h.sel - visible + 1;
-    h.offset = clamp(h.offset || 0, 0, Math.max(0, list.length - visible));
+    const boxW = Math.max(18, Math.min(W - 2, 96));
+    const inner = boxW - 2; // 左右边框之间
+    const cw = Math.max(8, inner - 2); // 选中标记 + 一个空格
+    const maxRows = Math.max(9, Math.min(H, Math.max(transcriptH + 4, 9)));
 
-    const lines = [];
-    const title = ` ${T.accentBold('历史对话')} ${T.dimmer('↑↓ 选择 · Enter 恢复 · d 删除 · ESC 关闭')} `;
-    const titleW = strWidth(stripAnsi(title));
-    lines.push(T.dimmer('╭─') + title + T.dimmer('─'.repeat(Math.max(0, boxW - 4 - titleW)) + '╮'));
-    lines.push(`${T.dimmer('│')} ${T.accent2('/')} ${padToWidth(truncToWidth(h.filter ? T.white(h.filter) : T.dimmer('输入关键词筛选（标题 / 模型 / 目录）'), inner - 2), inner - 2)} ${T.dimmer('│')}`);
+    // 每项高度不同（标题会换行），先排一遍再决定从哪一项开始画
+    const blocks = list.map((s) => this.histItemLines(s, cw));
+    const heights = blocks.map((b) => b.length);
+    const totalH = heights.reduce((a, b) => a + b, 0);
+    const contentRows = Math.max(1, Math.min(maxRows - 4, totalH || 1));
+    h.sel = clamp(h.sel || 0, 0, Math.max(0, list.length - 1));
+    let off = clamp(h.offset || 0, 0, Math.max(0, list.length - 1));
+    const sumH = (from, to) => {
+      let t = 0;
+      for (let i = from; i < to && i < heights.length; i++) t += heights[i] || 0;
+      return t;
+    };
+    if (h.sel < off) off = h.sel;
+    while (off < h.sel && sumH(off, h.sel + 1) > contentRows) off++;
+    let end = off;
+    let used = 0;
+    while (end < list.length && used + (heights[end] || 0) <= contentRows) {
+      used += heights[end] || 0;
+      end++;
+    }
+    if (end === off && off < list.length) end = off + 1;
+    h.offset = off;
+
+    const rule = (l, r, label = '') => {
+      const budget = Math.max(0, boxW - 2);
+      const shown = strWidth(stripAnsi(label)) > budget ? truncToWidth(label, budget) : label;
+      const fill = Math.max(0, budget - strWidth(stripAnsi(shown)));
+      return T.dimmer(l) + shown + T.dimmer('─'.repeat(fill) + r);
+    };
+    const row = (content) =>
+      `${T.dimmer('│')} ${padToWidth(truncToWidth(content, inner - 2), inner - 2)} ${T.dimmer('│')}`;
+
+    const hint =
+      h.rename != null
+        ? boxW < 46
+          ? '标题 · Enter 保存 · ESC 取消'
+          : '输入新标题 · Enter 保存 · ESC 取消'
+        : boxW < 56
+          ? h.pendingDelete
+            ? '再按 Ctrl+D / y 确认删除 · 其它键取消'
+            : '↑↓ 选择 · Enter 恢复 · P 置顶 · Ctrl+R 改名'
+          : h.pendingDelete
+            ? '删除这个会话？再按 Ctrl+D / y 确认删除，其它键取消'
+            : '↑↓ 选择 · Enter 恢复 · P 置顶 · 右键置顶 · Ctrl+R 改名 · Ctrl+D 删除 · ESC 关闭';
+    const head = ` ${T.accentBold('历史对话')} ${T.dimmer(`${Math.min(h.sel + 1, list.length)}/${list.length}`)} ${T.dimmer(hint)} `;
+    const lines = [rule('╭', '╮', '─' + head + '─')];
+    if (h.rename != null) {
+      lines.push(row(`${T.accent2('标题')} ${T.white(h.rename)}${T.accent('▏')}`));
+    } else {
+      const f = h.filter ? T.white(h.filter) + T.accent('▏') : T.dimmer('输入关键词（标题 / 目录 / 模型）');
+      lines.push(row(`${T.accent2('/')} ${f}`));
+    }
     lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
 
-    for (let i = 0; i < visible; i++) {
-      const idx = h.offset + i;
-      const s = list[idx];
-      if (!s) {
-        lines.push(`${T.dimmer('│')}${' '.repeat(boxW - 2)}${T.dimmer('│')}`);
-        continue;
-      }
-      const when = timeAgo(s.updated);
-      const dir = s.cwd ? path.basename(s.cwd) : '';
-      const tail = [String(s.msgs) + ' 条', dir ? truncToWidth(dir, 14) : '', truncToWidth(String(s.model || ''), 16)].filter(Boolean).join(' · ');
-      const body = `${T.dimmer(when.padEnd(9))} ${T.white(truncToWidth(s.title || '(无标题)', Math.max(10, inner - 46)))} ${T.dimmer(tail)}`;
-      if (idx === h.sel) {
-        const seg = padToWidth(truncToWidth(body, inner), inner);
-        lines.push(`${T.dimmer('│')}\x1b[48;5;238m${T.accent('→')}${seg} \x1b[0m${T.dimmer('│')}`);
-      } else {
-        lines.push(`${T.dimmer('│')} ${padToWidth(truncToWidth(body, inner), inner)} ${T.dimmer('│')}`);
+    let drawn = 0;
+    const hitRows = [];
+    for (let idx = off; idx < end && drawn < contentRows; idx++) {
+      const block = blocks[idx] || [];
+      const selected = idx === h.sel;
+      for (const ln of block) {
+        if (drawn >= contentRows) break;
+        const body = padToWidth(truncToWidth(ln, cw), cw);
+        if (selected) {
+          lines.push(`${T.dimmer('│')}\x1b[48;5;238m${T.accent('▏')}${body} \x1b[0m${T.dimmer('│')}`);
+        } else {
+          lines.push(`${T.dimmer('│')} ${body} ${T.dimmer('│')}`);
+        }
+        // 记住这行属于哪一项（鼠标点击用），行号在下面排完定下 startRow 后再回填
+        hitRows.push({ slot: lines.length - 1, idx });
+        drawn++;
       }
     }
-    lines.push(T.dimmer('╰' + '─'.repeat(boxW - 2) + '╯'));
-    const startRow = Math.max(0, Math.floor((H - lines.length) / 2));
+    while (drawn < contentRows) {
+      lines.push(row(''));
+      drawn++;
+    }
+    const more = [off > 0 ? '▲' : '', end < list.length ? '▼' : ''].filter(Boolean).join(' ');
+    lines.push(rule('╰', '╯', `─ ${T.dimmer(`${list.length} 个会话`)}${more ? ' ' + T.accent2(more) + ' ' : ' '}─`));
+
+    const startRow = Math.max(0, Math.floor((Math.min(H, maxRows) - lines.length) / 2));
     const padL = Math.max(0, Math.floor((W - boxW) / 2));
     const padR = Math.max(0, W - boxW - padL);
+    // 鼠标命中区：鼠标坐标是 1-based，行号从 0 开始
+    this.histHits = {
+      x0: padL,
+      x1: padL + boxW,
+      rows: hitRows.map((r) => ({ y: startRow + r.slot + 1, idx: r.idx })),
+    };
     lines.forEach((ln, i) => {
       const r = startRow + i;
-      if (r >= 0 && r < frame.length) frame[r] = ' '.repeat(padL) + padToWidth(ln, boxW) + ' '.repeat(padR);
+      if (r >= 0 && r < frame.length) frame[r] = ' '.repeat(padL) + padToWidth(truncToWidth(ln, boxW), boxW) + ' '.repeat(padR);
     });
+  }
+
+  /** 会话文件 → 界面气泡。新会话自带 items；老会话只有上下文节点，就按消息重建一遍。 */
+  itemsFromSession(data) {
+    if (Array.isArray(data.items) && data.items.length) return data.items.map((it) => ({ ...it, ver: (it.ver || 1) + 1 }));
+    const out = [];
+    for (const n of data.context?.nodes || []) {
+      if (n.kind !== 'message') continue;
+      const role = n.message?.role;
+      const c = n.message?.content;
+      if (role === 'user' && typeof c === 'string' && c.trim()) {
+        out.push({ kind: 'user', text: c.endsWith('\n') ? c : c + '\n', ver: 2 });
+      } else if (role === 'assistant') {
+        const t = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((p) => p.type === 'text').map((p) => p.text).join('') : '';
+        if (t && t.trim()) out.push({ kind: 'assistant', text: t, ver: 2, collapsible: true, collapsed: true });
+      }
+    }
+    return out;
   }
 
   loadSessionFile(file) {
@@ -1389,7 +1753,18 @@ export class App {
       this.agent.setSession(data);
       this.agent.sessionId = data.id;
       this.title = data.title || '';
-      if (Array.isArray(data.items) && data.items.length) this.items = data.items.map((it) => ({ ...it }));
+      this.items = [];
+      this.prevLines = [];
+      this.items = this.itemsFromSession(data);
+      // 恢复工作区：会话是在别的目录里聊的，工具也应该回到那里
+      if (data.cwd && data.cwd !== this.cwd) {
+        try {
+          if (fs.statSync(data.cwd).isDirectory()) {
+            this.cwd = data.cwd;
+            if (this.agent) this.agent.cwd = data.cwd;
+          }
+        } catch {}
+      }
       if (data.provider && data.model) {
         try {
           this.config.setActive(data.provider, data.model);
@@ -1397,14 +1772,21 @@ export class App {
         } catch {}
       }
       this.scroll = 0;
+      this.followAnchor = null;
       this.sel = null;
       const st = this.agent.engine?.stats;
       if (st) this.context = { tokens: st.tokens || 0, maxTokens: st.maxTokens || 128000, used: st.used || 0 };
-      this.push({ kind: 'note', text: `已恢复会话 ${data.id} · ${this.items.length} 条记录` });
+      const dir = data.cwd ? prettyCwd(data.cwd) : '';
+      this.push({
+        kind: 'note',
+        ephemeral: true,
+        text: `已恢复会话「${truncToWidth(String(data.title || data.id || ''), 60)}」· ${this.items.length} 条记录${dir ? ` · 工作区 ${dir}` : ''}`,
+      });
     } catch (e) {
       this.push({ kind: 'error', text: `恢复失败: ${e.message}` });
     }
     this.dirty = true;
+    this.needClear = true;
     this.render(true);
   }
 
@@ -1466,9 +1848,15 @@ export class App {
       } else {
         lines = this.renderItem(item, width);
         if (!live) {
-          item._cache = lines;
-          item._cacheW = W;
-          item._cacheVer = item.ver;
+          // 缓存只给「本帧还在用的」item 存；超出上限的旧 item 每帧都重算太贵，
+          // 所以下面的 trimTranscript 会把它们彻底丢掉（连同缓存）。
+          if (lines.length <= MAX_CACHED_LINES) {
+            item._cache = lines;
+            item._cacheW = W;
+            item._cacheVer = item.ver;
+          } else {
+            item._cache = null;
+          }
         }
       }
       spans.push({ item, start: out.length, end: out.length + lines.length - 1 });
@@ -1630,6 +2018,8 @@ export class App {
     this.agent.setAskHandler((payload) => this.askPlayer(payload));
     // 子代理 / 团队工具把进度推回界面：成员开工、完成、失败都会变成一条 note
     this.agent.setEventSink((item) => {
+      // 团队工具有动作就刷新引用（可能刚建队 / 刚收工）
+      this.activeTeam = getActiveTeam();
       if (item && typeof item === 'object') this.push(item);
     });
   }
@@ -1873,19 +2263,20 @@ export class App {
     if (!text) {
       fromClipboard = true;
       try {
-        const res = await readClipboard();
-        text = res.text || '';
-        if (!text.trim()) {
-          // 剪贴板里是截图：终端画不出图，就把图片路径给出去，模型用 read 能看
-          const img = await readClipboardImage();
-          if (img.ok && (img.path || img.paths?.length)) {
-            const paths = (img.paths && img.paths.length ? img.paths : [img.path]).map(quotePath).join(' ');
-            this.askInsert(paths);
-            this.push({ kind: 'note', text: '剪贴板里是图片，已把图片路径填入答案（回车发给 AI 前可再补充文字）', inline: true });
+        // 和主输入框一致：文字贴原文，文件/截图/其它一律贴路径（模型用 read 拿）
+        const r = await readClipboardAny();
+        if (r.kind !== 'text') {
+          if (r.ok && r.text) {
+            this.askInsert(r.text);
+            this.push({ kind: 'note', text: `${r.note || '已粘贴路径'}：${r.text}（回车发给 AI 前可再补充文字）`, inline: true });
             this.dirty = true;
             return this.render(true);
           }
+          this.push({ kind: 'note', text: r.err || '剪贴板里没有可粘贴的内容', inline: true });
+          this.dirty = true;
+          return this.render(true);
         }
+        text = r.text || '';
       } catch { text = ''; }
     }
     text = String(text || '').replace(/\r\n?/g, '\n').replace(/\n/g, ' ').replace(/\t/g, '  ');
@@ -1907,6 +2298,491 @@ export class App {
   }
 
   /** AI 提问的浮层：题目 + 选项 + 自定义输入行。 */
+  // ------------------------------------------------------------ 团队面板
+  /** 打开团队成员面板（没团队就提示）。 */
+  openTeamPanel() {
+    const team = this.activeTeam || getActiveTeam();
+    if (!team) {
+      const snap = lastTeamSnapshot(this.cwd);
+      return this.push({
+        kind: 'note',
+        text: snap
+          ? `当前没有活跃团队。上一支「${snap.name}」的成员：${(snap.members || []).map((m) => m.name).join('、')}（已收工，只能看历史快照）`
+          : '还没有团队。让 AI 用 team 工具组一队（先 /team on），或用 /team status 查看。',
+      });
+    }
+    this.teamPanel = { team, sel: 0, view: 'list', member: null, scroll: 0, offset: 0 };
+    this.dirty = true;
+    this.render(true);
+  }
+
+  closeTeamPanel() {
+    this.teamPanel = null;
+    this.dirty = true;
+    this.render(true);
+  }
+
+  /** 当前面板里选中的成员。 */
+  panelMember() {
+    const p = this.teamPanel;
+    if (!p) return null;
+    return p.team.members[clamp(p.sel, 0, Math.max(0, p.team.members.length - 1))] || null;
+  }
+
+  handleTeamPanelKey(ev) {
+    const p = this.teamPanel;
+    if (!p) return;
+    const k = ev.key;
+    this.dirty = true;
+    const team = p.team;
+    if (k === 'esc' || k === 'ctrl+c') return this.closeTeamPanel();
+    // 单个成员的会话视图
+    if (p.view === 'member') {
+      // 玩家明确要求：输入 return 回到主对话
+      if (k === 'up' || k === 'wheel-up') return void (p.scroll += 3);
+      if (k === 'down' || k === 'wheel-down') return void (p.scroll = Math.max(0, p.scroll - 3));
+      if (k === 'pageup') return void (p.scroll += 20);
+      if (k === 'pagedown') return void (p.scroll = Math.max(0, p.scroll - 20));
+      if (k === 'home') return void (p.scroll = 1e9);
+      if (k === 'end') return void (p.scroll = 0);
+      if (k === 'left' || k === 'backspace') {
+        p.view = 'list';
+        p.scroll = 0;
+        return;
+      }
+      if (k === 'text' || k === 'space' || k === 'paste') {
+        // 在面板里打字：命中 return 就回主对话（这是玩家指定的返回方式）
+        p.typed = (p.typed || '') + (k === 'space' ? ' ' : String(ev.text || ''));
+        if (/^\s*return\s*$/i.test(p.typed)) {
+          p.typed = '';
+          return this.closeTeamPanel();
+        }
+        if (p.typed.length > 12) p.typed = p.typed.slice(-12);
+        return;
+      }
+      return;
+    }
+    // 成员列表
+    if (k === 'up' || k === 'ctrl+p' || k === 'shift-tab' || k === 'wheel-up') return void (p.sel = Math.max(0, p.sel - 1));
+    if (k === 'down' || k === 'ctrl+n' || k === 'tab' || k === 'wheel-down') return void (p.sel = Math.min(team.members.length - 1, p.sel + 1));
+    if (k === 'enter' || k === 'right') {
+      const m = this.panelMember();
+      if (m) {
+        p.view = 'member';
+        p.member = m.id;
+        p.scroll = 0;
+        p.typed = '';
+      }
+      return;
+    }
+    if (k === 'text' || k === 'space') {
+      p.typed = (p.typed || '') + (k === 'space' ? ' ' : String(ev.text || ''));
+      const typed = p.typed.trim().toLowerCase();
+      if (typed === 'return') {
+        p.typed = '';
+        return this.closeTeamPanel();
+      }
+      // 数字直跳：1-9 选对应成员
+      if (/^[1-9]$/.test(typed)) {
+        p.sel = Math.min(team.members.length - 1, Number(typed) - 1);
+        p.typed = '';
+        return;
+      }
+      if (p.typed.length > 12) p.typed = p.typed.slice(-12);
+    }
+  }
+
+  /** 团队成员面板：左边成员列表 / 右边选中成员的会话。 */
+  composeTeamPanel(frame, W, H, transcriptH) {
+    const p = this.teamPanel;
+    const team = p.team;
+    const boxW = Math.max(30, Math.min(W - 2, 110));
+    const inner = boxW - 4;
+    const lines = [];
+    const rule = (l, r, label = '') => {
+      const budget = Math.max(0, boxW - 2);
+      const shown = strWidth(stripAnsi(label)) > budget ? truncToWidth(label, budget) : label;
+      const fill = Math.max(0, budget - strWidth(stripAnsi(shown)));
+      return T.dimmer(l) + shown + T.dimmer('─'.repeat(fill) + r);
+    };
+    const row = (content) => `${T.dimmer('│')} ${padToWidth(truncToWidth(content, inner - 2), inner - 2)} ${T.dimmer('│')}`;
+    const tot = team.totals();
+    const head = ` ${T.accentBold('团队成员')} ${T.dimmer(team.name)} ${T.dimmer(`${tot.done}/${tot.members} 完成`)} `;
+    lines.push(rule('╭', '╮', '─' + head + '─'));
+
+    if (p.view === 'member') {
+      const m = team.member(p.member) || this.panelMember();
+      if (!m) {
+        p.view = 'list';
+      } else {
+        const hints =
+          boxW < 60
+            ? '↑↓ 滚 · ←/ESC 返回列表 · 输 return 回主对话'
+            : '↑↓/PgUp/PgDn 滚动 · ← / ESC 回列表 · 直接输入 return 回车 回主对话';
+        lines.push(row(T.dimmer(hints)));
+        lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+        // 成员头：状态 + 步数 + 工具 + ctx
+        const ctxPct = m.ctx ? Math.round((m.ctx.used != null ? m.ctx.used : m.ctx.maxTokens ? m.ctx.tokens / m.ctx.maxTokens : 0) * 100) : null;
+        const idx = team.members.indexOf(m);
+        const col = T.member(idx);
+        const live = m.live?.tool ? ` ${T.dimmer('→')}${col(m.live.tool)}${m.live.hint ? ` ${T.dimmer(m.live.hint)}` : ''}` : '';
+        lines.push(row(`${col(m.name)} ${T.dimmer(`（${m.role}）`)} ${m.status === 'running' ? T.accent('进行中') : m.status === 'done' ? T.ok('完成') : m.status === 'error' ? T.err('失败') : T.dim('中断')} ${T.dim(`${m.steps} 步 · ${m.toolCalls} 工具`)}${ctxPct != null ? T.dim(` · ctx ${ctxPct}%`) : ''}${live}`));
+        lines.push(row(`${T.dimmer('任务：')}${T.dimer ? '' : ''}${truncToWidth(m.task.replace(/\s+/g, ' '), inner - 8)}`));
+        lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+
+        // 对话记录：按屏宽把每一条换成 1-N 行，再倒着取（scroll=0 = 最新）
+        const es = m.tr.entries();
+        const cw = Math.max(10, inner - 2);
+        const blocks = es.map((e) => this.panelEntryLines(e, cw, T.member(idx)));
+        const totalH = blocks.reduce((n, b) => n + b.length, 0);
+        const bodyH = Math.max(3, Math.min(H - 8, Math.floor(transcriptH * 0.86)));
+        const maxScroll = Math.max(0, totalH - bodyH);
+        p.scroll = clamp(p.scroll, 0, maxScroll);
+        const from = Math.max(0, totalH - bodyH - p.scroll);
+        const to = Math.min(totalH, from + bodyH);
+        const flat = [];
+        let acc = 0;
+        for (const b of blocks) {
+          for (const ln of b) {
+            if (acc >= from && acc < to) flat.push(ln);
+            acc++;
+          }
+        }
+        if (!flat.length) flat.push(T.dimmer('（暂无对话记录：他还没开口）'));
+        while (flat.length < bodyH) flat.push('');
+        for (const ln of flat) lines.push(row(ln));
+        const pos = totalH > bodyH ? T.dimmer(`${totalH - to + bodyH}/${totalH} 行`) : T.dimmer(`${totalH} 行`);
+        lines.push(rule('╰', '╯', `─ ${pos} ${p.scroll > 0 ? T.accent2('↑ 已上滚') : T.dimmer('↓ 最新')} `));
+        return this._blitPanel(frame, W, H, lines, boxW);
+      }
+    }
+
+    // 列表视图
+    lines.push(
+      row(
+        boxW < 60
+          ? T.dimmer('↑↓ 选成员 · Enter 看会话 · 输 return 回主对话')
+          : T.dimmer('↑↓ / 数字 选成员 · Enter 打开他的会话 · ESC 关闭 · 直接输入 return 回车 回主对话'),
+      ),
+    );
+    lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+    const cw = Math.max(10, inner - 2);
+    team.members.forEach((m, i) => {
+      const col = T.member(i);
+      const sel = i === clamp(p.sel, 0, team.members.length - 1);
+      const ctxPct = m.ctx ? Math.round((m.ctx.used != null ? m.ctx.used : 0) * 100) : null;
+      const stat = m.status === 'running' ? T.accent('进行中') : m.status === 'done' ? T.ok('完成') : m.status === 'error' ? T.err('失败') : T.dim(m.status);
+      const liveStr = m.live?.tool ? ` ${T.dimmer('→')}${col(m.live.tool)}` : m.live?.thinking ? T.dimmer(' 思考中') : '';
+      const title = `${col(m.name)} ${T.dimmer(`（${m.role}）`)} ${stat}${liveStr}`;
+      const meta = T.dimmer(`${m.steps} 步 · ${m.toolCalls} 工具${ctxPct != null ? ` · ctx ${ctxPct}%` : ''}${i === (team.members.findIndex((x) => x.status === 'running')) ? '' : ''}`);
+      const mark = sel ? T.accent('▸') : ' ';
+      const body = `${mark} ${title}  ${meta}`;
+      if (sel) {
+        const bg = String.fromCharCode(27) + '[48;5;238m';
+        const reset = String.fromCharCode(27) + '[0m';
+        lines.push(`${T.dimmer('│')}${bg}${padToWidth(truncToWidth(body, cw), cw)}${reset}${T.dimmer('│')}`);
+      } else {
+        lines.push(row(body));
+      }
+      // 任务一行（长了截）
+      lines.push(row(`  ${T.dimmer(truncToWidth(m.task.replace(/\s+/g, ' '), cw - 4))}`));
+    });
+    const typed = (p.typed || '').trim();
+    lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+    lines.push(row(`${T.accent2('>')} ${typed ? T.white(typed) : T.dimmer('输入 return 回车 回主对话')}`));
+    lines.push(rule('╰', '╯', `─ ${T.dimmer(`${team.members.length} 人`)} `));
+    return this._blitPanel(frame, W, H, lines, boxW);
+  }
+
+  // ------------------------------------------------------- /shellManager
+  /**
+   * Shell 任务管理面板（终端版，和以前的浏览器 Shell 页同一个用途）：
+   *   · 左边：每条命令（来源 / 状态 / 退出码 / 耗时 / 输出大小）
+   *   · Enter：看这条命令的完整输出（跑着的看实时尾巴）
+   *   · Ctrl+K：终止正在跑的命令；Ctrl+D：清空历史（运行中的保留）
+   *   · 输 return 回车：回主对话
+   */
+  openShellManager() {
+    this.shellPanel = { sel: 0, view: 'list', job: null, scroll: 0, typed: '', note: '' };
+    this.dirty = true;
+    this.render(true);
+  }
+
+  closeShellPanel() {
+    this.shellPanel = null;
+    this.dirty = true;
+    this.render(true);
+  }
+
+  /** 面板里当前选中的那条命令（列表按 jobs.list 的顺序：新的在前）。 */
+  panelJob() {
+    const p = this.shellPanel;
+    if (!p) return null;
+    const list = jobs.list(200);
+    return list[clamp(p.sel, 0, Math.max(0, list.length - 1))] || null;
+  }
+
+  handleShellPanelKey(ev) {
+    const p = this.shellPanel;
+    if (!p) return;
+    const k = ev.key;
+    this.dirty = true;
+    const list = jobs.list(200);
+    if (k === 'ctrl+c') return this.closeShellPanel();
+    // 详情视图：ESC / ← 回列表（想直接退出面板连按两次 ESC 就行）
+    if (k === 'esc' && p.view === 'detail') {
+      p.view = 'list';
+      p.scroll = 0;
+      p.typed = '';
+      return;
+    }
+    if (k === 'esc') return this.closeShellPanel();
+    if (p.view === 'detail') {
+      if (k === 'up' || k === 'wheel-up') return void (p.scroll += 3);
+      if (k === 'down' || k === 'wheel-down') return void (p.scroll = Math.max(0, p.scroll - 3));
+      if (k === 'pageup') return void (p.scroll += 20);
+      if (k === 'pagedown') return void (p.scroll = Math.max(0, p.scroll - 20));
+      if (k === 'home') return void (p.scroll = 1e9);
+      if (k === 'end') return void (p.scroll = 0);
+      if (k === 'left' || k === 'backspace') {
+        p.view = 'list';
+        p.scroll = 0;
+        return;
+      }
+      if (k === 'ctrl+k') return this.killSelectedJob();
+      if (k === 'text' || k === 'space' || k === 'paste') {
+        p.typed = (p.typed || '') + (k === 'space' ? ' ' : String(ev.text || ''));
+        if (/^\s*return\s*$/i.test(p.typed)) {
+          p.typed = '';
+          return this.closeShellPanel();
+        }
+        if (p.typed.length > 12) p.typed = p.typed.slice(-12);
+        return;
+      }
+      return;
+    }
+    // 列表视图
+    if (k === 'up' || k === 'ctrl+p' || k === 'shift-tab' || k === 'wheel-up') return void (p.sel = Math.max(0, p.sel - 1));
+    if (k === 'down' || k === 'ctrl+n' || k === 'tab' || k === 'wheel-down') return void (p.sel = Math.min(Math.max(0, list.length - 1), p.sel + 1));
+    if (k === 'enter' || k === 'right') {
+      const j = this.panelJob();
+      if (j) {
+        p.view = 'detail';
+        p.job = j.id;
+        p.scroll = 0;
+        p.typed = '';
+      }
+      return;
+    }
+    if (k === 'ctrl+k') return this.killSelectedJob();
+    if (k === 'ctrl+d') {
+      const kept = jobs.clear();
+      p.sel = 0;
+      p.note = `已清空历史（${kept} 条还在跑）`;
+      return;
+    }
+    if (k === 'text' || k === 'space') {
+      p.typed = (p.typed || '') + (k === 'space' ? ' ' : String(ev.text || ''));
+      const typed = p.typed.trim().toLowerCase();
+      if (typed === 'return') {
+        p.typed = '';
+        return this.closeShellPanel();
+      }
+      if (/^[1-9]$/.test(typed)) {
+        p.sel = Math.min(Math.max(0, list.length - 1), Number(typed) - 1);
+        p.typed = '';
+        return;
+      }
+      if (p.typed.length > 12) p.typed = p.typed.slice(-12);
+    }
+  }
+
+  /** 终止当前选中的命令（会杀掉持久 shell，下条命令自动重启）。 */
+  killSelectedJob() {
+    const p = this.shellPanel;
+    if (!p) return;
+    const j = p.view === 'detail' ? jobs.get(p.job) || this.panelJob() : this.panelJob();
+    if (!j) {
+      p.note = '没有选中的命令';
+      return;
+    }
+    if (j.status !== 'running') {
+      p.note = `这条已经结束了（${j.status}），不用终止`;
+      return;
+    }
+    const r = jobs.kill(j.id);
+    p.note = r.content;
+    this.push({ kind: r.ok ? 'note' : 'warn', text: `[shell] ${r.content}` });
+  }
+
+  /** Shell 任务面板：左边命令列表 / 右边选中命令的输出。 */
+  composeShellPanel(frame, W, H, transcriptH) {
+    const p = this.shellPanel;
+    const list = jobs.list(200);
+    const boxW = Math.max(40, Math.min(W - 2, 118));
+    const inner = boxW - 4;
+    const lines = [];
+    const rule = (l, r, label = '') => {
+      const budget = Math.max(0, boxW - 2);
+      const shown = strWidth(stripAnsi(label)) > budget ? truncToWidth(label, budget) : label;
+      const fill = Math.max(0, budget - strWidth(stripAnsi(shown)));
+      return T.dimmer(l) + shown + T.dimmer('─'.repeat(fill) + r);
+    };
+    const row = (content) => `${T.dimmer('│')} ${padToWidth(truncToWidth(content, inner - 2), inner - 2)} ${T.dimmer('│')}`;
+    const running = list.filter((j) => j.status === 'running').length;
+    const head = ` ${T.accentBold('Shell 任务')} ${T.dimmer(`${list.length} 条`)} ${running ? T.ok(`· ${running} 个在跑`) : ''} `;
+    lines.push(rule('╭', '╮', '─' + head + '─'));
+
+    // ---------- 详情：一条命令的完整输出（跑着的看实时尾巴）
+    if (p.view === 'detail') {
+      const j = jobs.get(p.job);
+      if (!j) {
+        p.view = 'list';
+      } else {
+        const st = this._jobStatusBadge(j);
+        const hints = boxW < 70 ? '↑↓ 滚 · ←/ESC 回列表 · Ctrl+K 终止 · 输 return 回主对话' : '↑↓/PgUp/PgDn 滚 · ← / ESC 回列表 · Ctrl+K 终止 · 直接输入 return 回车 回主对话';
+        lines.push(row(T.dimmer(hints)));
+        lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+        const cw = Math.max(20, inner - 2);
+        // 命令行本身（长命令折行显示，别截掉后半段）
+        for (const seg of wrapWords(`$ ${j.command}` || '$ ', cw)) lines.push(row(T.white(seg)));
+        const meta = [
+          st,
+          T.dimmer(`${j.source}${j.cwd ? ` · ${j.cwd}` : ''}`),
+          T.dimmer(this._fmtDur(j.dur, j.started, j.ended)),
+          j.bytes ? T.dimmer(`${fmtBytes(j.bytes)}`) : '',
+          j.truncated ? T.warn('（输出已截断）') : '',
+        ]
+          .filter(Boolean)
+          .join(T.dimmer(' · '));
+        lines.push(row(meta));
+        lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+        // 输出：跑着显示实时尾巴，结束后显示完整输出（倒序翻页）
+        const body = (j.status === 'running' ? j.tail || j.output : j.output) || '';
+        const all = body.split('\n');
+        const bodyRows = Math.max(6, Math.min(28, H - 16));
+        const maxScroll = Math.max(0, all.length - bodyRows);
+        const off = Math.min(Math.max(0, p.scroll), maxScroll);
+        const start = Math.max(0, all.length - bodyRows - off);
+        const shown = all.slice(start, start + bodyRows);
+        if (!body) lines.push(row(T.dimmer(j.status === 'running' ? '（还没输出）' : '（没有输出）')));
+        for (const ln of shown) lines.push(row(T.text(truncToWidth(ln, cw))));
+        if (all.length > bodyRows) {
+          lines.push(row(T.dimmer(`… 共 ${all.length} 行${off ? `，往下还能滚 ${off} 行` : '，已到底'}`)));
+        }
+        const typed = (p.typed || '').trim();
+        lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+        lines.push(row(`${T.accent2('>')} ${typed ? T.white(typed) : T.dimmer('输入 return 回车 回主对话')}`));
+        lines.push(rule('╰', '╯', `─ ${T.dimmer(j.id)} `));
+        return this._blitPanel(frame, W, H, lines, boxW);
+      }
+    }
+
+    // ---------- 列表
+    lines.push(
+      row(
+        boxW < 70
+          ? T.dimmer('↑↓ 选 · Enter 看输出 · Ctrl+K 终止 · 输 return 回主对话')
+          : T.dimmer('↑↓ / 数字 选命令 · Enter 看完整输出 · Ctrl+K 终止 · Ctrl+D 清空历史 · 直接输入 return 回车 回主对话'),
+      ),
+    );
+    if (p.note) lines.push(row(T.accent2(p.note)));
+    lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+    if (!list.length) {
+      lines.push(row(T.dimmer('还没有命令记录（AI 跑过 shell 之后这里就有了）')));
+    }
+    const cw = Math.max(16, inner - 2);
+    const maxRows = Math.max(4, Math.min(18, H - 14));
+    const sel = clamp(p.sel, 0, Math.max(0, list.length - 1));
+    // 选中项始终可见（列表长了会自动滚动）
+    const from = Math.max(0, Math.min(sel - Math.floor(maxRows / 2), Math.max(0, list.length - maxRows)));
+    list.slice(from, from + maxRows).forEach((j, i) => {
+      const idx = from + i;
+      const isSel = idx === sel;
+      const st = this._jobStatusBadge(j);
+      const right = T.dimmer(`${this._fmtDur(j.dur, j.started, j.ended)}${j.bytes ? ` · ${fmtBytes(j.bytes)}` : ''}`);
+      const mark = isSel ? T.accent('▸') : ' ';
+      const body = `${mark} ${st} ${T.text(truncToWidth(j.command || '(空命令)', cw - 24))}  ${right}`;
+      if (isSel) {
+        const bg = String.fromCharCode(27) + '[48;5;238m';
+        const reset = String.fromCharCode(27) + '[0m';
+        lines.push(`${T.dimmer('│')}${bg}${padToWidth(truncToWidth(body, cw), cw)}${reset}${T.dimmer('│')}`);
+      } else {
+        lines.push(row(body));
+      }
+    });
+    if (list.length > maxRows) lines.push(row(T.dimmer(`… 共 ${list.length} 条，↑↓ 继续翻`)));
+    const typed = (p.typed || '').trim();
+    lines.push(T.dimmer('├' + '─'.repeat(boxW - 2) + '┤'));
+    lines.push(row(`${T.accent2('>')} ${typed ? T.white(typed) : T.dimmer('输入 return 回车 回主对话')}`));
+    lines.push(rule('╰', '╯', `─ ${T.dimmer(`${list.length} 条 · ${running} 个在跑`)} `));
+    return this._blitPanel(frame, W, H, lines, boxW);
+  }
+
+  /** 命令状态的小徽章。 */
+  _jobStatusBadge(j) {
+    if (j.status === 'running') return T.warn('● 跑着');
+    if (j.status === 'ok') return T.ok('✓ 成功');
+    if (j.status === 'killed') return T.err('■ 已终止');
+    if (j.status === 'timeout') return T.err('⏱ 超时');
+    return T.err(`✗ exit ${j.code}`);
+  }
+
+  /** 耗时：跑着显示已跑多久，结束显示总耗时。 */
+  _fmtDur(dur, started, ended) {
+    // dur 是 shell 实测的耗时，比 ended-started（可能受计时抖动影响）更准
+    const ms = dur || (ended && started ? ended - started : started ? Date.now() - started : 0);
+    if (!ms) return '0.0s';
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    const m = Math.floor(ms / 60000);
+    const s = Math.round((ms % 60000) / 1000);
+    return `${m}m${s ? `${s}s` : ''}`;
+  }
+
+  /** 把面板画到屏幕中间（复用历史弹层的定位逻辑）。 */
+  _blitPanel(frame, W, H, lines, boxW) {
+    const startRow = Math.max(0, Math.floor((H - lines.length) / 2));
+    const padL = Math.max(0, Math.floor((W - boxW) / 2));
+    const padR = Math.max(0, W - boxW - padL);
+    lines.forEach((ln, i) => {
+      const r = startRow + i;
+      if (r >= 0 && r < frame.length) frame[r] = ' '.repeat(padL) + padToWidth(truncToWidth(ln, boxW), boxW) + ' '.repeat(padR);
+    });
+  }
+
+  /** Transcript 条目 → 面板里的几行（带颜色）。 */
+  panelEntryLines(e, cw, col) {
+    const wrap = (prefix, text, paint) => {
+      const all = String(text || '').split('\n');
+      const out = [];
+      all.slice(0, 40).forEach((raw, i) => {
+        const segs = wrapWords(raw || ' ', Math.max(8, cw - 2));
+        for (const s of segs) out.push(`${i === 0 ? prefix : '   '}${paint(s)}`);
+      });
+      if (all.length > 40) out.push(`   ${T.dimmer('…（更长，已截）')}`);
+      return out;
+    };
+    if (e.k === 'task') return wrap(T.accent2('任务 '), e.text, T.white);
+    if (e.k === 'think') return wrap(T.dimmer('思考 '), e.text, T.think);
+    if (e.k === 'text') return wrap(col('◆ '), e.text, T.text);
+    if (e.k === 'result') return wrap(T.ok('交代 '), e.text, T.plain);
+    if (e.k === 'error') return wrap(T.err('× '), e.text, T.err);
+    if (e.k === 'note') return wrap(T.dimmer('· '), e.text, T.dimmer);
+    if (e.k === 'tool') {
+      const st = e.status === 'run' ? T.accent2('…') : e.status === 'err' ? T.err('×') : T.ok('√');
+      const head = `${st} ${col(e.name)}${e.hint ? ` ${T.dimer ? T.dimmer(e.hint) : e.hint}` : ''}${e.dur ? T.dimmer(` ${(e.dur / 1000).toFixed(1)}s`) : ''}`;
+      const out = [head];
+      if (e.result) {
+        const lines = String(e.result).split('\n').slice(0, 6);
+        for (const l of lines) out.push(`   ${T.dimmer(truncToWidth(l, Math.max(8, cw - 4)))}`);
+        if (String(e.result).split('\n').length > 6) out.push(`   ${T.dimmer('…')}`);
+      }
+      return out;
+    }
+    return wrap(' ', e.text || '', T.dimer ? T.dim : T.dim);
+  }
+
   composeAskOverlay(frame, W, H, transcriptH) {
     const st = this.askState;
     const boxW = Math.min(W - 4, 86);
@@ -2088,6 +2964,8 @@ export class App {
   // ------------------------------------------------------------------- keys
   handleKey(ev) {
     if (this.askState) return this.handleAskKey(ev);
+    if (this.shellPanel) return this.handleShellPanelKey(ev);
+    if (this.teamPanel) return this.handleTeamPanelKey(ev);
     if (this.histOverlay) return this.handleHistoryKey(ev);
     if (this.picker) return this.handlePickerKey(ev);
     if (this.prompt) return this.handlePromptKey(ev);
@@ -2585,13 +3463,13 @@ export class App {
           T.headerLine(' 工具 '),
           row('基础', t('read', 'write', 'edit', 'shell')),
           row('源码', t('glob', 'grep', 'ls', 'git', 'think')),
-          row('联网', t('web_search', 'web_fetch', 'browser', 'http_request')),
+          row('联网', t('web_search', 'web_fetch', 'http_request')),
           row('记忆', t('todo', 'memory', 'skill')),
           row('上下文', `${T.accent('context')} ${T.dim('billion-context：压缩 / 检索 / 展开历史')}`),
           T.headerLine(' 协作（默认关闭，会多花 token） '),
           row('subagent', `${onOff(this.config.subagentsEnabled)} 派子代理干子任务`),
-          row('team', `${onOff(this.config.teamEnabled)} 组队并行开发（浏览器看进度）`),
-          `  ${T.dim('开启：/subagents on · /team on　　团队面板：/progress')}`,
+          row('team', `${onOff(this.config.teamEnabled)} 组队并行开发`),
+          `  ${T.dim('开启：/subagents on · /team on')}`,
           T.headerLine(' 权限与工具链 '),
           `  工作区 ${T.accent(prettyCwd(this.cwd))}   ${this.config.allowOutsideCwd ? T.warn('全权模式已开') : T.dim('只能改工作区内文件')}`,
           `  ${T.dim('写文件前自动快照，可用 /undo 回滚；hooks 可用 /hooks 查看')}`,
@@ -2633,9 +3511,17 @@ export class App {
       case 'sessions': {
         const list = this.listSessions();
         if (!list.length) return this.push({ kind: 'note', text: '还没有保存的会话。' });
+        const w = Math.max(30, (this.width || 100) - 8);
         return this.push({
           kind: 'multi',
-          lines: ['已保存会话（/resume <序号>，或 /history 打开选择器）:', ...list.map((s, i) => `  ${String(i + 1).padStart(2)}. ${T.text(String(s.title).slice(0, 40))} ${T.dimmer(`· ${s.provider}/${s.model} · ${s.msgs} 条`)}`)],
+          lines: [
+            '已保存会话（/resume <序号>，或 /history 打开选择器，支持筛选 / 改名 / 删除）:',
+            ...list.map((s, i) => {
+              const meta = `· ${s.provider || '?'}/${s.model || '?'} · ${s.msgs} 条 · ${s.cwd ? prettyCwd(s.cwd) : '?'}`;
+              const titleW = Math.max(12, w - strWidth(meta) - 8);
+              return `  ${String(i + 1).padStart(2)}. ${T.text(truncToWidth(String(s.title || '(无标题)'), titleW))} ${T.dimmer(meta)}`;
+            }),
+          ],
         });
       }
       case 'history':
@@ -2702,7 +3588,7 @@ export class App {
             `团队协作  ${on ? T.ok('已开启') : T.dim('未开启')}`,
             T.dim('  开启后 AI 可以组一支小队并行开发：每个成员一个角色 + 一份任务，共享同一个工作区。'),
             T.dim('  代价：每个成员各自一套模型调用，token 成倍。并发默认 settings.teamConcurrency=2。'),
-            T.dim('  用法：/team on | off · 团队面板 /progress'),
+            T.dim('  用法：/team on | off。看成员会话用 /teamPanel，开关下方工具行用 /teamShow。'),
           ];
           if (snap) {
             const tot = snap.totals || {};
@@ -2716,6 +3602,7 @@ export class App {
         }
         if (!['on', 'off'].includes(v)) return this.push({ kind: 'warn', text: '用法：/team on | off（不带参数查看状态）' });
         this.config.setTeamEnabled(v === 'on');
+        this.activeTeam = getActiveTeam();
         return this.push({
           kind: 'note',
           text:
@@ -2724,58 +3611,31 @@ export class App {
               : '团队协作已关闭（team 工具已从模型工具清单中移除；已在跑的团队不受影响）。',
         });
       }
-      case 'progress': {
+      case 'teamshow': {
         const v = String(arg || '').trim().toLowerCase();
-        if (v === 'off') {
-          this.config.setProgress(false);
-          resetHub();
-          return this.push({ kind: 'note', text: '团队面板已关闭（settings.progress=false）。' });
+        if (!v) {
+          const on = this.config.settings.teamShow !== false;
+          return this.push({
+            kind: 'note',
+            text: `团队成员工具行：${on ? T.ok('显示') : T.dim('不显示')}（/teamShow on | off）${on ? '' : T.dimmer(' · 思考中的成员本来就不显示')}`,
+          });
         }
-        const hub = await ensureHub(this.config);
-        if (!hub) return this.push({ kind: 'warn', text: '团队面板没起来：检查 settings.progress / progressPort（默认 7870）。' });
-        this.bindSpawn(hub);
-        if (v === 'open') openInBrowser(hub.url);
+        if (!['on', 'off'].includes(v)) return this.push({ kind: 'warn', text: '用法：/teamShow on | off（不带参数查看当前状态）' });
+        this.config.setSettings({ teamShow: v === 'on' });
+        this.dirty = true;
+        this.render(true);
         return this.push({
-          kind: 'multi',
-          lines: [
-            `团队面板  ${T.accent(hub.url)}`,
-            T.dim('  团队面板：左边选成员，右边看他这一路的完整对话（含工具输出与思考），还能直接在下面给他传话。'),
-            T.dim('  Shell 任务 /shell · 手动开工 /spawn（浏览器里直接组队或派子代理）。'),
-            T.dim('  只监听 127.0.0.1，关掉终端就停。输入 /progress open 自动开浏览器。'),
-          ],
+          kind: 'note',
+          text:
+            v === 'on'
+              ? '已显示团队成员工具调用（输入框上方一行，颜色区分成员；成员在思考时不显示）。'
+              : '已关闭团队成员工具行（成员仍在后台干活，进度看 /teamPanel 或 /team status）。',
         });
       }
-      case 'shell': {
-        const hub = await ensureHub(this.config);
-        if (!hub) return this.push({ kind: 'warn', text: '后端没起来：检查 settings.progress / progressPort（默认 7870）。' });
-        this.bindSpawn(hub);
-        const url = hub.url.replace(/\/$/, '') + '/shell';
-        if (String(arg || '').trim().toLowerCase() === 'open') openInBrowser(url);
-        return this.push({
-          kind: 'multi',
-          lines: [
-            `Shell 任务  ${T.accent(url)}`,
-            T.dim('  主代理 / 子代理跑过的每条 shell 都在这里：实时输出、耗时、退出码，可手动终止或清空。'),
-            T.dim('  输入 /shell open 自动开浏览器。'),
-          ],
-        });
-      }
-      case 'spawn': {
-        const hub = await ensureHub(this.config);
-        if (!hub) return this.push({ kind: 'warn', text: '后端没起来：检查 settings.progress / progressPort（默认 7870）。' });
-        this.bindSpawn(hub);
-        const url = hub.url.replace(/\/$/, '') + '/spawn';
-        if (String(arg || '').trim().toLowerCase() === 'open') openInBrowser(url);
-        this.push({
-          kind: 'multi',
-          lines: [
-            `手动开工  ${T.accent(url)}`,
-            T.dim('  浏览器里填目标/成员就能组队，或单独派一个子代理；进度实时回面板与终端。'),
-            T.dim('  输入 /spawn open 自动开浏览器。'),
-          ],
-        });
-        return;
-      }
+      case 'teampanel':
+        return this.openTeamPanel();
+      case 'shellmanager':
+        return this.openShellManager();
       case 'queue': {
         const v = String(arg || '').trim().toLowerCase();
         if (v === 'clear') {
@@ -2823,15 +3683,7 @@ export class App {
         const list = this.listSessions();
         const n = Number(arg) - 1;
         if (!list[n]) return this.push({ kind: 'warn', text: '序号无效，先 /sessions 查看。' });
-        const data = JSON.parse(fs.readFileSync(list[n].file, 'utf8'));
-        this.agent.setSession(data);
-        this.items = [];
-        this.prevLines = [];
-        process.stdout.write('\x1b[2J');
-        this.pushWelcome();
-        this.push({ kind: 'note', text: `已恢复会话：${data.title}（${data.context?.nodes?.length || 0} 条节点）` });
-        this.dirty = true;
-        return this.render(true);
+        return this.loadSessionFile(list[n].file);
       }
       case 'todo': {
         const { readTodo, formatTodo } = await import('../tools/todo.js');
@@ -3002,6 +3854,11 @@ export class App {
       for await (const ev of this.agent.run(text)) {
         this.paintNow();
         switch (ev.type) {
+          case 'turn_start': {
+            // 玩家一开口就把当前会话写进 ~/.agent/sessions（不用等这一轮跑完）
+            this.saveSession();
+            break;
+          }
           case 'text': {
             /* streaming text: paint immediately for a responsive feel */
             const a = ensureAssistant();
@@ -3213,10 +4070,15 @@ export class App {
       fs.mkdirSync(SESSIONS_DIR, { recursive: true });
       if (!this.title) this.title = this.deriveTitle();
       const snap = this.agent.snapshot(this.title);
-      if (!snap.context?.nodes?.length) return;
       snap.cwd = this.cwd;
       snap.items = this.serializeItems();
-      fs.writeFileSync(path.join(SESSIONS_DIR, `${snap.id}.json`), JSON.stringify(snap, null, 1));
+      // 上下文还没建、也没有任何对话时不要写空会话
+      if (!snap.context?.nodes?.length && !snap.items.length) return;
+      const file = path.join(SESSIONS_DIR, `${snap.id}.json`);
+      // 先写临时文件再 rename：写到一半崩溃也不会把旧历史弄成半截 JSON
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(snap, null, 1));
+      fs.renameSync(tmp, file);
     } catch {}
   }
 
@@ -3230,13 +4092,16 @@ export class App {
 
   /** Items are mostly plain data; trim the big fields so sessions stay small. */
   serializeItems() {
-    return this.items.slice(-400).map((it) => {
-      const o = { ...it };
-      delete o._cache;
-      if (typeof o.content === 'string' && o.content.length > 20000) o.content = o.content.slice(0, 20000) + '\n…（历史记录已截断）';
-      if (typeof o.text === 'string' && o.text.length > 40000) o.text = o.text.slice(0, 40000);
-      return o;
-    });
+    return this.items
+      .filter((it) => !it.ephemeral)
+      .slice(-400)
+      .map((it) => {
+        const o = { ...it };
+        delete o._cache;
+        if (typeof o.content === 'string' && o.content.length > 20000) o.content = o.content.slice(0, 20000) + '\n…（历史记录已截断）';
+        if (typeof o.text === 'string' && o.text.length > 40000) o.text = o.text.slice(0, 40000);
+        return o;
+      });
   }
 
   listSessions() {
@@ -3248,19 +4113,49 @@ export class App {
           const file = path.join(SESSIONS_DIR, f);
           try {
             const j = JSON.parse(fs.readFileSync(file, 'utf8'));
-            return { file, id: j.id || '', title: j.title || '(无标题)', cwd: j.cwd || '', provider: j.provider, model: j.model, msgs: j.context?.nodes?.length || 0, updated: j.updated || 0 };
+            return {
+              file,
+              id: j.id || '',
+              title: j.title || '(无标题)',
+              cwd: j.cwd || '',
+              provider: j.provider,
+              model: j.model,
+              msgs: j.context?.nodes?.length || j.items?.length || 0,
+              updated: j.updated || 0,
+              // 置顶：置顶的永远排前面，组内仍按最近更新排
+              pinned: !!j.pinned,
+              pinnedAt: Number(j.pinnedAt) || 0,
+            };
           } catch {
             return null;
           }
         })
         .filter(Boolean)
-        .sort((a, b) => b.updated - a.updated)
-        .slice(0, 20);
+        // 置顶优先 → 置顶时间新的在上 → 其余按更新时间
+        .sort((a, b) => Number(b.pinned) - Number(a.pinned) || (b.pinned ? b.pinnedAt - a.pinnedAt : 0) || b.updated - a.updated)
+        .slice(0, 50);
     } catch {
       return [];
     }
   }
 
+  /**
+   * 切换一个会话的置顶状态（只改会话文件里的 pinned 字段，不动内容）。
+   * @returns {boolean|null} 新的置顶状态；文件读不到返回 null
+   */
+  togglePinSession(file) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      data.pinned = !data.pinned;
+      data.pinnedAt = data.pinned ? Date.now() : 0;
+      fs.writeFileSync(file, JSON.stringify(data, null, 1));
+      return data.pinned;
+    } catch {
+      return null;
+    }
+  }
+
+  /** --continue：启动时恢复上一个会话（上下文 + 屏幕上的对话）。 */
   loadLatestSession() {
     const list = this.listSessions();
     if (!list.length) return;
@@ -3268,7 +4163,17 @@ export class App {
       const data = JSON.parse(fs.readFileSync(list[0].file, 'utf8'));
       this.agent.setSession(data);
       this.agent.sessionId = data.id;
-      this.title = data.title;
+      this.title = data.title || '';
+      // 恢复出来的对话直接画回屏幕上，不然「继续」只剩上下文、界面空白
+      this.items = this.itemsFromSession(data);
+      if (data.cwd && data.cwd !== this.cwd) {
+        try {
+          if (fs.statSync(data.cwd).isDirectory()) {
+            this.cwd = data.cwd;
+            if (this.agent) this.agent.cwd = data.cwd;
+          }
+        } catch {}
+      }
     } catch {}
   }
 }

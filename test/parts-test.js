@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-parts-'));
 process.env.AGENT_HOME = HOME;
@@ -133,7 +134,9 @@ check(
   check('part 支持 anchor 相对坐标', /应用 1 条 op/.test(r.content));
   const board = JSON.parse(fs.readFileSync(path.join(HOME, 'draw', 'anchor.json'), 'utf8'));
   const cv = new Canvas(board.w, board.h);
-  cv.data.set(Buffer.from(board.data, 'base64'));
+  // 存档格式已改成 deflate 压缩的 z 字段（大画布裸 base64 太大），
+  // 测试必须同时兼容 z / 旧的 data，否则这里 Buffer.from(undefined) 直接抛错。
+  cv.data.set(board.z ? zlib.inflateSync(Buffer.from(board.z, 'base64')) : Buffer.from(board.data, 'base64'));
   const box = cv.bbox();
   check('anchor + x/y 生效（落点右移）', box.minX >= 19 && box.minX <= 21, JSON.stringify(box));
 }

@@ -17,12 +17,14 @@ const linesOf = (s) => String(s || '').split(String.fromCharCode(10)).length;
 // 老位置：每种工具「参数 → 一行提示」（放在标签后面）
 const HINTS = {
   shell: (i) => i.command,
+  jobs: (i) => `${i.action || 'list'}${i.id ? ` ${i.id}` : ''}`,
+  diagnostics: (i) => i.check || (i.command ? oneLine(i.command, 50) : '自动探测'),
+  patch: (i) => oneLine(String(i.diff || '').split('\n').find((l) => l.startsWith('+++ '))?.slice(4) || '', 50),
   read: (i) => i.path,
   write: (i) => i.path,
   edit: (i) => i.path,
   web_search: (i) => i.query,
   web_fetch: (i) => i.url,
-  browser: (i) => `${i.action || 'open'} ${i.url || ''}`,
   context: (i) => `${i.action || 'status'}`,
   skill: (i) => (String(i.action || '').toLowerCase() === 'load' ? '' : i.action),
   todo: (i) => (i.action && i.action !== 'list' ? i.action : ''),
@@ -49,6 +51,43 @@ export function describeTool(item = {}) {
     note: '',
     tone: 'tool',
   };
+
+  if (name === 'jobs') {
+    const action = String(input.action || 'list').toLowerCase();
+    view.label = `jobs · ${action}`;
+    if (action === 'list') {
+      if (meta.running) view.tags.push(tag(`${meta.running} 个在跑`, 'ok'));
+      view.tags.push(tag(`${meta.count || 0} 条`));
+    } else if (action === 'tail') {
+      if (meta.running) view.tags.push(tag('实时', 'ok'));
+      if (meta.status) view.tags.push(tag(meta.status, meta.status === 'ok' ? 'ok' : meta.status === 'running' ? 'info' : 'warn'));
+      if (meta.lines) view.tags.push(tag(`${meta.lines} 行`));
+    } else if (action === 'kill') {
+      view.tags.push(tag(meta.killed ? '已终止' : '未终止', meta.killed ? 'warn' : 'info'));
+    }
+    return view;
+  }
+
+  if (name === 'diagnostics') {
+    view.label = 'diagnostics';
+    if (meta.checks?.length) view.tags.push(tag(meta.checks.join('+'), 'skill'));
+    if (meta.errors) view.tags.push(tag(`${meta.errors} 错误`, 'warn'));
+    if (meta.warnings) view.tags.push(tag(`${meta.warnings} 警告`, 'warn'));
+    if (meta.total === 0) view.tags.push(tag('干净', 'ok'));
+    if (meta.total) view.tags.push(tag(`${meta.total} 条`));
+    return view;
+  }
+
+  if (name === 'patch') {
+    view.label = 'patch';
+    if (meta.dryRun) view.tags.push(tag('试跑', 'skill'));
+    const nf = (meta.files || []).length;
+    if (nf) view.tags.push(tag(`${nf} 文件`));
+    if (meta.added || meta.removed) view.tags.push(tag(`+${meta.added || 0} −${meta.removed || 0}`, 'ok'));
+    if (meta.created) view.tags.push(tag(`新建 ${meta.created}`));
+    if (meta.deleted) view.tags.push(tag(`删除 ${meta.deleted}`, 'warn'));
+    return view;
+  }
 
   if (name === 'subagent') {
     const s = meta.subagent || {};
@@ -122,20 +161,6 @@ export function describeTool(item = {}) {
       if (meta.used != null) view.tags.push(tag(`${(meta.used * 100).toFixed(1)}%`));
       if (meta.tokens != null && meta.maxTokens) view.tags.push(tag(`${kNum(meta.tokens)}/${kNum(meta.maxTokens)}`));
       if (meta.blocks != null) view.tags.push(tag(`${meta.blocks} 块`));
-    }
-    return view;
-  }
-
-  if (name === 'browser') {
-    const action = String(input.action || 'open').toLowerCase();
-    if (action === 'screenshot') {
-      view.tags.push(tag('截图'));
-      if (meta.size) view.tags.push(tag(meta.size));
-      if (meta.bytes) view.tags.push(tag(fmtBytes(meta.bytes)));
-    } else {
-      view.tags.push(tag('渲染'));
-      if (meta.chars != null) view.tags.push(tag(`${kNum(meta.chars)} 字符`));
-      if (meta.truncated) view.tags.push(tag('已截断', 'warn'));
     }
     return view;
   }

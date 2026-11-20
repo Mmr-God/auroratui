@@ -1,9 +1,8 @@
 // 子代理 / 团队协作的离线测试：不打网络。
-// 团队用注入的假 runner 跑（真 runner 要调模型），团队面板用真 HTTP 请求验。
+// 团队用注入的假 runner 跑（真 runner 要调模型）。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-collab-'));
@@ -12,8 +11,7 @@ process.env.AGENT_HOME = HOME;
 const { Config } = await import('../src/config.js');
 const { enabledTools, runTool } = await import('../src/tools/index.js');
 const { teamTool } = await import('../src/tools/team.js');
-const { Team, teamDir, setActiveTeam } = await import('../src/team.js');
-const { ProgressHub, ensureHub, dashboardHtml, resetHub } = await import('../src/progress.js');
+const { Team, teamDir, setActiveTeam, getActiveTeam } = await import('../src/team.js');
 const { describeTool } = await import('../src/ui/toolview.js');
 const { scopedConfig } = await import('../src/subagent.js');
 const { Agent } = await import('../src/agent.js');
@@ -40,35 +38,13 @@ function coldImport(rel) {
     return String(e.stderr || e.message).trim().split('\n')[0].slice(0, 160) || 'failed';
   }
 }
-for (const rel of ['team.js', 'subagent.js', 'progress.js', 'tools/team.js', 'tools/subagent.js', 'tools/index.js']) {
+for (const rel of ['team.js', 'subagent.js', 'transcript.js', 'tools/team.js', 'tools/subagent.js', 'tools/index.js']) {
   const r = coldImport(rel);
   check(`单独 import src/${rel} 不炸`, r === true, r === true ? '' : r);
 }
 
-function freePort() {
-  return new Promise((resolve) => {
-    const s = http.createServer();
-    s.listen(0, '127.0.0.1', () => {
-      const p = s.address().port;
-      s.close(() => resolve(p));
-    });
-  });
-}
-function get(urlPath, port) {
-  return new Promise((resolve, reject) => {
-    const req = http.get({ host: '127.0.0.1', port, path: urlPath }, (res) => {
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (c) => (body += c));
-      res.on('end', () => resolve({ status: res.statusCode, body, headers: res.headers }));
-    });
-    req.on('error', reject);
-  });
-}
-
-const port = await freePort();
 const config = new Config();
-config.setSettings({ progress: true, progressPort: port, subagents: false, team: false });
+config.setSettings({ subagents: false, team: false });
 
 // ------------------------------------------------------------- 开关与工具清单
 const names = (list) => list.map((t) => t.name);
@@ -108,29 +84,6 @@ check('越权工具被拦', blocked.isError && /权限范围/.test(blocked.conte
 const scoped = scopedConfig(config, { model: 'cheap-model', settings: { maxSteps: 5 } });
 check('scopedConfig 不改主配置', config.active.model !== 'cheap-model' && scoped.active.model === 'cheap-model' && scoped.settings.maxSteps === 5);
 
-// ------------------------------------------------------------------ 团队面板服务
-// 走单例入口：团队 / 子代理工具也是拿这同一个面板，端口被占时自动往后挑
-const hub = await ensureHub(config);
-check('面板能启动', !!hub && /^http:\/\/127\.0\.0\.1:\d+\/$/.test(hub.url), hub?.url);
-check('默认用配置里的端口', hub && hub.port === port, String(hub?.port));
-const dup = new ProgressHub({ port });
-const dupUrl = await dup.ensure();
-check('端口被占时自动换端口', new URL(dupUrl).port !== String(port), dupUrl);
-dup.stop();
-const stateRes = await get('/api/state', hub.port);
-check('/api/state 返回 JSON', stateRes.status === 200 && JSON.parse(stateRes.body).log.length === 0);
-const page = await get('/', hub.port);
-check('/ 返回面板页面', page.status === 200 && /text\/html/.test(page.headers['content-type']));
-check('页面含 EventSource 与标题', /EventSource/.test(page.body) && /团队面板/.test(page.body));
-const health = await get('/health', hub.port);
-check('/health 正常', health.status === 200 && JSON.parse(health.body).ok === true);
-hub.log({ kind: 'note', who: '测试', text: '面板日志' });
-hub.update({ title: 'Aurora · 测试' });
-await wait(260);
-const state2 = JSON.parse((await get('/api/state', hub.port)).body);
-check('日志进了面板状态', state2.log.length === 1 && state2.log[0].text === '面板日志' && state2.title === 'Aurora · 测试');
-check('dashboardHtml 自包含', /Aurora/.test(dashboardHtml()) && !/https?:\/\/[^"']*\.(js|css)/.test(dashboardHtml()));
-
 // ----------------------------------------------------------------- 团队（假跑）
 const said = [];
 const members = [
@@ -154,7 +107,6 @@ const fakeRunner = async ({ member, onEvent, onAgent }) => {
 };
 
 const team = new Team({ config, cwd: WS, name: '测试小队', goal: '把 a.js/b.js 的接口对齐', members, concurrency: 2, runner: fakeRunner });
-await team.attachHub(config);
 setActiveTeam(team);
 await team.start();
 check('开跑后状态是 running', team.status === 'running' && team.members.some((m) => m.status !== 'pending'));
@@ -171,11 +123,6 @@ const persisted = JSON.parse(fs.readFileSync(path.join(teamDir(WS), 'latest.json
 check('快照落盘', persisted.name === '测试小队' && persisted.members.length === 3 && persisted.totals.done === 3);
 const doneSay = team.say('前端', '再补一个断言');
 check('已完成的成员不能传话', doneSay.ok === false && /没法插话/.test(doneSay.content));
-
-// 面板里能看到团队
-const state3 = JSON.parse((await get('/api/state', hub.port)).body);
-check('面板拿到团队快照', state3.team?.name === '测试小队' && state3.team.members.length === 3 && state3.totals.done === 3);
-check('面板日志有成员动态', state3.log.some((l) => l.kind === 'member_done'));
 
 // 运行中传话 + 停止
 const slow = new Team({
@@ -207,13 +154,153 @@ const ctx = { config: cfgOn, cwd: WS, emit: () => {} };
 const toolReport = await teamTool.execute({ action: 'report' }, ctx);
 check('team report 返回报告', /前端/.test(toolReport.content) && /后端/.test(toolReport.content));
 const toolStatus = await teamTool.execute({ action: 'status' }, ctx);
-check('team status 带团队面板地址', /团队面板：http:\/\/127\.0\.0\.1/.test(toolStatus.content) && /3\/3 完成/.test(toolStatus.content));
+check('team status 报进度', /3\/3 完成/.test(toolStatus.content));
 const badAction = await teamTool.execute({ action: 'nonsense' }, ctx);
 check('未知 action 报错', badAction.isError && /不认识/.test(badAction.content));
 const noMembers = await teamTool.execute({ action: 'create', goal: 'g' }, ctx);
 check('缺成员时报错', noMembers.isError && /members/.test(noMembers.content));
 const noGoal = await teamTool.execute({ action: 'create', members: [{ task: 'x' }] }, ctx);
 check('缺目标时报错', noGoal.isError && /goal/.test(noGoal.content));
+
+// ------------------------------------------------------ 团队简报 / 共享板 / ctx
+{
+  // 搭建一个带项目记忆与待办的假工作区
+  const BWS = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-team-brief-'));
+  fs.mkdirSync(path.join(BWS, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(BWS, 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(BWS, 'MEMORY.md'), '# 项目约定\n- 构建用 npm run build');
+  fs.writeFileSync(path.join(BWS, 'src', 'main.js'), 'export const a = 1;\n');
+  fs.writeFileSync(path.join(BWS, 'node_modules', 'noise.js'), 'x');
+  const { ContextEngine } = await import('../src/context/engine.js');
+  const eng = new ContextEngine({});
+  eng.addUser('把 main.js 的主流程接到新接口上');
+  eng.addAssistant({ content: '我已经查到：src/main.js 里导出常量 a，没有 main() 函数；构建命令是 npm run build，入口在 package.json 的 bin 字段。' });
+  const briefCtx = { config: cfgOn, cwd: BWS, emit: () => {}, engine: eng };
+  const bres = await teamTool.execute(
+    {
+      action: 'create',
+      name: '简报队',
+      goal: '接接口',
+      briefing: '关键事实：src/main.js:1 只有常量 a，没有入口函数',
+      members: [{ name: '甲', task: '改 main.js' }],
+      concurrency: 1,
+    },
+    briefCtx,
+  );
+  const bt = getActiveTeam();
+  check('create 返回里提示不要 wait 干等', /不要 team\/wait 干等/.test(bres.content), bres.content.slice(0, 80));
+  check('团队带上了简报', bt.briefing.includes('src/main.js:1') && bt.briefing.includes('npm run build'), `${bt.briefing.length} 字符`);
+  check('简报含项目结构且跳过 node_modules', /src\/main\.js|main\.js/.test(bt.briefing) && !/noise\.js/.test(bt.briefing));
+  check('简报含主代理已说过的结论', /导出常量 a|没有 main\(\)/.test(bt.briefing), '(从上下文继承)');
+  bt.stop();
+}
+
+{
+  // 共享板：先完工的成员结论会进 board，后启动的成员（和正在跑的成员）都能拿到
+  const seen = [];
+  const bt2 = new Team({
+    config,
+    cwd: WS,
+    name: '共享板队',
+    goal: 'g',
+    briefing: '已知：接口在 api.js',
+    members: [
+      { name: '甲', role: 'dev', task: 'a' },
+      { name: '乙', role: 'dev', task: 'b' },
+    ],
+    concurrency: 1,
+    runner: async ({ member, briefing, board, onAgent }) => {
+      const queued = [];
+      onAgent?.({ queue: (s) => queued.push(s) });
+      seen.push({ name: member.name, briefing, board: [...(board || [])] });
+      await wait(60);
+      // 模拟成员跑着时收到别的成员的结论
+      member._queuedSeen = queued.slice();
+      return { text: `${member.name} 完成了：把 api.js 的 export 改成了 default`, usage: {}, steps: 2 };
+    },
+  });
+  await bt2.start();
+  await bt2.waitAll(4000);
+  const jia = seen.find((s) => s.name === '甲');
+  const yi = seen.find((s) => s.name === '乙');
+  check('成员拿到团队简报', jia?.briefing === '已知：接口在 api.js' && yi?.briefing === '已知：接口在 api.js');
+  check('第一个成员开始时共享板是空的', jia?.board.length === 0);
+  check('后启动的成员看到前面成员的结论', yi?.board.some((l) => /甲/.test(l) && /api\.js/.test(l)), JSON.stringify(yi?.board));
+  check('共享板排除了自己的结论', !yi?.board.some((l) => /乙/.test(l)));
+  check('共享板累计 2 条结论且对外可读', bt2.board.length === 2 && bt2.board.every((b) => typeof b.text === 'string'));
+}
+
+{
+  // 上下文占用：usage 事件里的 ctx 要塞进成员快照（面板 & 工具都能读到）
+  const bt3 = new Team({
+    config,
+    cwd: WS,
+    name: 'ctx 队',
+    goal: 'g',
+    members: [{ name: '甲', task: 'a' }],
+    concurrency: 1,
+    runner: async ({ onEvent }) => {
+      onEvent({ type: 'usage', total: { input: 10, output: 5, cost: 0 }, context: { tokens: 64000, maxTokens: 128000, used: 0.5, messages: 12, blocks: 1 } });
+      onEvent({ type: 'compact_end', block: 'b1', topic: '读代码' });
+      return { text: 'ok', usage: {}, steps: 1 };
+    },
+  });
+  await bt3.start();
+  await bt3.waitAll(4000);
+  const sm = bt3.snapshot({ events: false }).members[0];
+  check('成员快照带上下文占用', sm.ctx?.tokens === 64000 && sm.ctx?.maxTokens === 128000 && Math.round(sm.ctx.used * 100) === 50, JSON.stringify(sm.ctx));
+  check('成员快照记录压缩次数', sm.compactions === 1, String(sm.compactions));
+}
+
+{
+  // 子代理默认工具集：要包含 skill / context 与插件工具，但永远不给 team/subagent/plugin/ask
+  const { resolveToolSet, rolePrompt } = await import('../src/subagent.js');
+  const { getTool } = await import('../src/tools/index.js');
+  const { pluginTools, autoloadPlugins } = await import('../src/tools/plugin.js');
+  try {
+    await autoloadPlugins();
+  } catch {}
+  const extras = pluginTools().map((p) => p.name);
+  const set = resolveToolSet(null, getTool, { extra: extras }).map((t) => t.name);
+  check('子代理默认能用 skill / context', set.includes('skill') && set.includes('context'), set.join(','));
+  check('子代理默认拿到插件工具', extras.every((n) => set.includes(n)), `插件: ${extras.join(',') || '（无）'}`);
+  check('子代理永远拿不到 team/subagent/plugin/ask', !['team', 'subagent', 'plugin', 'ask'].some((n) => set.includes(n)));
+  const onlyRead = resolveToolSet(['read', 'team', 'ask'], getTool).map((t) => t.name);
+  check('点名工具时仍过滤禁区', onlyRead.includes('read') && !onlyRead.includes('team') && !onlyRead.includes('ask'), onlyRead.join(','));
+  const rp = rolePrompt({ role: 'dev', task: '改 x', team: { name: '队', goal: 'g', briefing: '已知：x 在 src/x.js', board: ['甲（dev）：改好了 y'] } });
+  check('角色提示含团队简报', /已知：x 在 src\/x\.js/.test(rp) && /不要再 read 一遍/.test(rp));
+  check('角色提示含其他成员结论', /甲（dev）：改好了 y/.test(rp) && /别重复做/.test(rp));
+  check('角色提示含省上下文纪律', /先 grep \/ glob 定位/.test(rp) && /同一个文件只读一次/.test(rp));
+}
+
+{
+  // 成员文件范围 = 真的写保护（不是提示词），防止队友互相覆盖
+  const { writeTool, editTool } = await import('../src/tools/fs.js');
+  const SW = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-scope-'));
+  fs.mkdirSync(path.join(SW, 'src', 'core'), { recursive: true });
+  fs.mkdirSync(path.join(SW, 'test'), { recursive: true });
+  fs.writeFileSync(path.join(SW, 'src', 'core', 'a.js'), 'a\n');
+  const ctx = { cwd: SW, writeScope: ['src/core/a.js'] };
+  const okWrite = await writeTool.execute({ path: 'src/core/a.js', content: 'aa\n' }, ctx);
+  check('范围内文件可写', !okWrite.isError, okWrite.content?.slice(0, 60));
+  const denied = await writeTool.execute({ path: 'src/core/other.js', content: 'x' }, ctx);
+  check('范围外文件被拒', denied.isError && /不在你负责的文件范围内/.test(denied.content), denied.content?.slice(0, 60));
+  const deniedEdit = await editTool.execute({ path: 'test/x.js', old_string: 'a', new_string: 'b' }, ctx);
+  check('范围外 edit 也被拒', deniedEdit.isError && /不在你负责的文件范围内/.test(deniedEdit.content));
+  check('被拒的文件确实没被创建', !fs.existsSync(path.join(SW, 'src', 'core', 'other.js')));
+  // 目录范围：写目录里的任意文件都行
+  const dirCtx = { cwd: SW, writeScope: ['test/'] };
+  const okDir = await writeTool.execute({ path: 'test/t1.js', content: 'x\n' }, dirCtx);
+  const badDir = await writeTool.execute({ path: 'src/core/a.js', content: 'x' }, dirCtx);
+  check('目录范围按前缀放行', !okDir.isError && badDir.isError);
+  // 没设范围时完全不拦（主代理/普通子代理）
+  const free = await writeTool.execute({ path: 'src/core/other.js', content: 'x\n' }, { cwd: SW });
+  check('没有 writeScope 时不拦', !free.isError);
+  // 读不受限
+  const { readTool } = await import('../src/tools/fs.js');
+  const rd = await readTool.execute({ path: 'src/core/a.js' }, ctx);
+  check('读不受文件范围限制', !rd.isError, String(rd.content).slice(0, 30));
+}
 
 // ---------------------------------------------------------------- 界面封装层
 const dv = describeTool({ name: 'subagent', input: { task: '补测试', name: '测试-1' }, meta: { subagent: { name: '测试-1', role: 'QA', steps: 12, toolCalls: 7, tokens: { input: 900, output: 300 }, cost: 0.01, secs: 40 } }, content: 'x' });
@@ -235,7 +322,7 @@ check('团队工具块标题', /team · 小队/.test(dt.label) && dt.tags.some((
 
   const { App } = await import('../src/ui/app.js');
   const appCfg = new Config();
-  appCfg.setSettings({ progress: true, progressPort: await freePort(), subagents: false, team: false });
+  appCfg.setSettings({ subagents: false, team: false });
   const app = new App({ config: appCfg, cwd: WS });
   const lastText = () => {
     const it = app.items[app.items.length - 1];
@@ -256,10 +343,6 @@ check('团队工具块标题', /team · 小队/.test(dt.label) && dt.tags.some((
   check('/team on 开关生效', appCfg.teamEnabled === true && /已开启/.test(on2));
   const tl = await run('/tools');
   check('/tools 列出协作区且显示已开', /subagent/.test(tl) && /team/.test(tl) && /已开/.test(tl));
-  const pr = (await run('/progress')).replace(/\x1b\[[0-9;]*m/g, '');
-  check('/progress 打印团队面板地址', /团队面板\s+http:\/\/127\.0\.0\.1:\d+\//.test(pr), pr.split('\n')[0]);
-  const off = await run('/progress off');
-  check('/progress off 关得掉', appCfg.settings.progress === false && /已关闭/.test(off));
   const bad = await run('/subagents maybe');
   check('/subagents 参数校验', /用法/.test(bad));
   // 团队 / 子代理在后台产生的提示要能直接冒到界面上
@@ -273,6 +356,5 @@ check('团队工具块标题', /team · 小队/.test(dt.label) && dt.tags.some((
   }
 }
 
-resetHub();
 log(failed ? `\n${failed} 个检查失败` : '\n子代理 / 团队检查全部通过');
 process.exit(failed ? 1 : 0);

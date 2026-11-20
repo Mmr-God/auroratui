@@ -72,6 +72,25 @@ export function truncToWidth(s, width, ellipsis = '…') {
   return out + ellipsis + '\x1b[0m';
 }
 
+// 从左边截断：保留结尾（路径这种「尾部才有区分度」的字符串用）。
+// 会丢掉原字符串里的样式，调用方自己套样式即可。
+export function truncLeft(s, width, ellipsis = '…') {
+  const plain = stripAnsi(s);
+  if (width <= 0) return '';
+  if (strWidth(plain) <= width) return s;
+  const budget = Math.max(0, width - strWidth(ellipsis));
+  const chars = Array.from(plain);
+  let out = '';
+  let w = 0;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const cw = charWidth(chars[i]);
+    if (w + cw > budget) break;
+    out = chars[i] + out;
+    w += cw;
+  }
+  return ellipsis + out;
+}
+
 export function padToWidth(s, width, align = 'left', filler = ' ') {
   const w = strWidth(s);
   if (w >= width) return s;

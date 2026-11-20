@@ -202,7 +202,7 @@ check('save 另存一份', fs.existsSync(path.join(WS, 'assets', 'out.png')));
 const tiny = await run({ name: 'tiny', size: 4 });
 check('size 被夹到下限 8', /8×8/.test(tiny.content), tiny.content.split(NL)[0]);
 const huge = await run({ name: 'huge', size: 9999 });
-check('size 被夹到上限 256', /256×256/.test(huge.content), huge.content.split(NL)[0]);
+check('size 被夹到上限 1024', /1024×1024/.test(huge.content), huge.content.split(NL)[0]);
 
 // ------------------------------------------------------- 坏 op 给出可读提示
 const badOp = await run({ name: 'bad', ops: [{ op: 'fill_rectt', x: 1, y: 1, w: 2, h: 2 }] });
@@ -212,8 +212,8 @@ check('坏配方名列出全部配方', /未知配方 dragon/.test(badStamp.cont
 
 // ------------------------------------------------- 画板文件可跨进程读回
 const saved2 = JSON.parse(fs.readFileSync(path.join(HOME, 'draw', 'smoke.json'), 'utf8'));
-check('画板存成 json（含像素与历史）', saved2.w === 32 && typeof saved2.data === 'string' && Array.isArray(saved2.history));
-check('画板 base64 长度匹配像素数', Buffer.from(saved2.data, 'base64').length === 32 * 32 * 4);
+check('画板存成 json（含像素与历史）', saved2.w === 32 && typeof saved2.z === 'string' && Array.isArray(saved2.history));
+check('画板像素能解压回原长度', zlib.inflateSync(Buffer.from(saved2.z, 'base64')).length === 32 * 32 * 4);
 
 // --------------------------------------------------------- 诊断会点出问题
 const empty = await run({ name: 'empty', view: true });
@@ -278,7 +278,9 @@ check('空画板给出提示', /空的/.test(empty.content), empty.content.split
   applyOps(cv, [{ op: 'fill_ellipse', cx: 16, cy: 16, rx: 12, ry: 12, color: '#3b82f6' }]);
   const dark = cv.autoOutline(0.3);
   check('auto_outline 由主色推出更暗的描边色', resolveColor(dark) !== '#3b82f6' && /^#[0-9a-f]{6}$/.test(dark), dark);
-  const edge = px(cv, 16, 4);
+  // 用包围盒算顶部边缘，而不是写死坐标（椭圆栅格化方式变了，写死坐标的测试会假报）
+  const bb = cv.bbox();
+  const edge = px(cv, 16, bb.minY);
   check('auto_outline 真的把边缘换成描边色', `#${edge.slice(0, 3).map((v) => v.toString(16).padStart(2, '0')).join('')}` === dark, edge.join());
 
   const cv2 = new Canvas(32, 32);
@@ -327,7 +329,7 @@ check('空画板给出提示', /空的/.test(empty.content), empty.content.split
   check('不传 grid 时文件名不带 _grid', !/_grid/.test(nogrid.meta.path), nogrid.meta.path);
   check('grid 覆盖的像素不污染画板存档', (() => {
     const b = JSON.parse(fs.readFileSync(path.join(HOME, 'draw', 'gridtest.json'), 'utf8'));
-    const buf = Buffer.from(b.data, 'base64');
+    const buf = zlib.inflateSync(Buffer.from(b.z, 'base64'));
     return buf[3] === 255 && buf[4] === 0; // 只有 (0,0) 那一个白点，没有品红
   })());
 }
@@ -342,6 +344,242 @@ check('空画板给出提示', /空的/.test(empty.content), empty.content.split
   const c = new Canvas(32, 32);
   applyOps(c, [{ op: 'noise', cx: 16, cy: 16, r: 8, count: 20, seed: 7, color: '#ffffff' }]);
   check('同 seed 的 noise 结果确定', c.countOpaque() === b.countOpaque());
+}
+
+// ---------------------------------- 回归：三个「画出来很丑」的坑
+{
+  // bug1：自动描边不该给半透明像素（地影/腮红）也描实心边
+  const cv = new Canvas(20, 20);
+  applyOps(cv, [{ op: 'fill_ellipse', cx: 10, cy: 10, rx: 5, ry: 5, color: '#34d399' }]);
+  // 半透明地影，宽宽一堆半透明像素
+  applyOps(cv, [{ op: 'fill_ellipse', cx: 10, cy: 18, rx: 7, ry: 2, color: '#000000', alpha: 40 }]);
+  applyOps(cv, [{ op: 'auto_outline' }]);
+  const shadowEdge = px(cv, 3, 18); // 阴影最左边缘
+  const bodyEdge = px(cv, 10, cv.bbox().minY); // 主体顶部（按包围盒，不写死坐标）
+  check('bug1 半透明地影边缘没被描成实心', shadowEdge[3] < 128, shadowEdge.join());
+  check('bug1 实心主体边缘照旧描了', bodyEdge[3] === 255 && bodyEdge[0] < 120, bodyEdge.join());
+
+  // 手动 outline_in（minAlpha=8）仍然照描半透明：模型点名要描就照做
+  const cv2 = new Canvas(10, 10);
+  applyOps(cv2, [{ op: 'fill_rect', x: 2, y: 2, w: 6, h: 6, color: '#ffffff', alpha: 60 }]);
+  applyOps(cv2, [{ op: 'outline_in', color: '#000000' }]);
+  check('bug1 手动 outline_in 仍会描半透明区', px(cv2, 2, 4)[3] === 255, px(cv2, 2, 4).join());
+}
+{
+  // bug2：彩色半透明叠彩色不该变灰；灰阶半透明仍走普通叠色
+  const cv = new Canvas(8, 8);
+  cv.setPx(2, 2, '#34d399'); // 绿底
+  cv.setPx(2, 2, '#f08fa8', 150); // 粉腮红（默认 auto）
+  const [r, g, b] = px(cv, 2, 2);
+  check('bug2 粉腮红叠绿 不发灰（r 明显大于 g）', r > g + 20, `${r},${g},${b}`);
+
+  const cv2 = new Canvas(8, 8);
+  cv2.setPx(2, 2, '#34d399');
+  cv2.setPx(2, 2, '#000000', 70); // 黑地影 -> 应该压暗成暗绿
+  const [r2, g2, b2] = px(cv2, 2, 2);
+  check('bug2 黑地影叠绿 仍是绿的（没被洗成灰）', g2 > r2 + 30 && g2 > b2, `${r2},${g2},${b2}`);
+
+  const cv3 = new Canvas(8, 8);
+  cv3.setPx(2, 2, '#000000', 38); // 透明处画半透明黑：还是半透明黑
+  const [r3, g3, b3, a3] = px(cv3, 2, 2);
+  check('bug2 半透明黑画在透明处 保持原样', r3 === 0 && g3 === 0 && b3 === 0 && a3 === 38, `${r3},${g3},${b3},${a3}`);
+}
+{
+  // bug3：同名画板沿用旧画面 -> fresh:true 能丢掉旧画面；沿用时有提示
+  await run({ name: 'stale', ops: [{ op: 'fill_rect', x: 0, y: 0, w: 8, h: 8, color: '#ff0000' }] });
+  const r2 = await run({ name: 'stale', ops: [{ op: 'fill_rect', x: 40, y: 40, w: 8, h: 8, color: '#00ff00' }] });
+  check('bug3 沿用旧画板时给出「已有画面」提示', /已有画面/.test(r2.content), '');
+  const r3 = await run({ name: 'stale', fresh: true, ops: [{ op: 'fill_rect', x: 40, y: 40, w: 8, h: 8, color: '#00ff00' }] });
+  check('bug3 fresh:true 从空白开始', /从空白开始/.test(r3.content) && /不透明像素 64\//.test(r3.content), r3.content.split(NL)[0]);
+}
+
+// ------------------------------------------- erase 带颜色 = 盖掉而不是挖透明
+{
+  const cv = new Canvas(12, 12);
+  applyOps(cv, [{ op: 'fill_rect', x: 0, y: 0, w: 12, h: 12, color: '#ff0000' }]);
+  applyOps(cv, [{ op: 'erase', x: 3, y: 3, w: 4, h: 4 }]);
+  check('erase 不带 color 是挖成透明', px(cv, 4, 4)[3] === 0, px(cv, 4, 4).join());
+
+  applyOps(cv, [{ op: 'fill_rect', x: 0, y: 0, w: 12, h: 12, color: '#ff0000' }]);
+  applyOps(cv, [{ op: 'erase', x: 3, y: 3, w: 4, h: 4, color: '#0000ff' }]);
+  check('erase 带 color 是用该色盖掉', px(cv, 4, 4).join() === '0,0,255,255', px(cv, 4, 4).join());
+  check('erase 带 color 不影响区域外', px(cv, 0, 0).join() === '255,0,0,255', px(cv, 0, 0).join());
+}
+
+// ------------------------------------------- 椭圆栅格化不产生 1px 凸刺
+{
+  const cv = new Canvas(64, 64);
+  applyOps(cv, [{ op: 'fill_ellipse', cx: 32, cy: 32, rx: 20, ry: 20 }]);
+  // 圆最顶上不该只有孤零零 1 个像素（那就是凸刺）
+  let topRow = 0;
+  for (let x = 0; x < cv.w; x++) if (cv.a(x, cv.bbox().minY) > 8) topRow++;
+  check('椭圆顶部不是孤点（>=3 像素宽）', topRow >= 3, String(topRow));
+  // 左右两侧对称、每行连续
+  let holes = 0;
+  for (let y = 0; y < cv.h; y++) {
+    let first = -1;
+    let last = -1;
+    let cnt = 0;
+    for (let x = 0; x < cv.w; x++) if (cv.a(x, y) > 8) { if (first < 0) first = x; last = x; cnt++; }
+    if (first >= 0 && cnt !== last - first + 1) holes++;
+  }
+  check('椭圆每行都是连续像素（无空洞）', holes === 0, String(holes));
+}
+
+// ------------------------------------------- blend:lighten（高光按底色提亮）
+{
+  const cv = new Canvas(32, 32);
+  applyOps(cv, [{ op: 'fill_ellipse', cx: 16, cy: 16, rx: 12, ry: 12, color: '#a855f7' }]);
+  applyOps(cv, [{ op: 'auto_shade', amount: 0.3 }]);
+  // 左上比左下亮（渐变存在）
+  check('auto_shade 真的做出了上下渐变', px(cv, 11, 8)[1] > px(cv, 11, 24)[1] + 10, `${px(cv, 11, 8).join()}`);
+
+  // 平色高光：区域内颜色一模一样（盖掉了渐变）
+  const flat = cv.clone();
+  applyOps(flat, [{ op: 'fill_ellipse', cx: 11, cy: 11, rx: 4, ry: 3, color: '#d8b4fe' }]);
+  // lighten 高光：区域内仍是变化的（保留了渐变），且比底色亮
+  const lit = cv.clone();
+  applyOps(lit, [{ op: 'fill_ellipse', cx: 11, cy: 11, rx: 4, ry: 3, blend: 'lighten', alpha: 110 }]);
+
+  const base = px(cv, 11, 11);
+  const l0 = px(lit, 11, 11);
+  check('blend:lighten 比底色亮', l0[0] + l0[1] + l0[2] > base[0] + base[1] + base[2] + 30, `底 ${base.join()} → 亮 ${l0.join()}`);
+  check('blend:lighten 不会顶成纯白（不刺眼）', !(l0[0] === 255 && l0[1] === 255 && l0[2] === 255), l0.slice(0, 3).join());
+  // alpha 控制提亮强度：全不透明时接近白，半透明时只是淡淡一层
+  const hard = cv.clone();
+  applyOps(hard, [{ op: 'fill_ellipse', cx: 11, cy: 11, rx: 4, ry: 3, blend: 'lighten' }]);
+  check('blend:lighten 的 alpha 能控制强度（全不透明比半透明亮）',
+    px(hard, 11, 11)[0] + px(hard, 11, 11)[1] > l0[0] + l0[1] + 10, `${px(hard, 11, 11).slice(0, 3).join()} vs ${l0.slice(0, 3).join()}`);
+  // 高光带内上下两处亮度不同 => 底色渐变被保留
+  const top = px(lit, 11, 9);
+  const bot = px(lit, 11, 13);
+  check('blend:lighten 保留了底色渐变（不平刷）', top.join() !== bot.join(), `${top.slice(0, 3).join()} vs ${bot.slice(0, 3).join()}`);
+  check('平色高光则把渐变盖成一块（对照）', px(flat, 11, 9).join() === px(flat, 11, 13).join());
+}
+
+// ------------------------------------------- blend:darken（阴影按底色压暗）
+{
+  const cv = new Canvas(32, 32);
+  applyOps(cv, [{ op: 'fill_ellipse', cx: 16, cy: 16, rx: 12, ry: 12, color: '#a855f7' }]);
+  applyOps(cv, [{ op: 'auto_shade', amount: 0.3 }]);
+
+  const base = px(cv, 16, 22);
+  const dk = cv.clone();
+  applyOps(dk, [{ op: 'fill_ellipse', cx: 16, cy: 22, rx: 5, ry: 3, blend: 'darken', alpha: 150 }]);
+  const d0 = px(dk, 16, 22);
+  check('blend:darken 比底色暗',
+    d0[0] + d0[1] + d0[2] < base[0] + base[1] + base[2] - 30,
+    `底 ${base.join()} → 暗 ${d0.join()}`);
+  check('blend:darken 不会压成纯黑', !(d0[0] === 0 && d0[1] === 0 && d0[2] === 0), d0.slice(0, 3).join());
+
+  // 关键差异：有色阴影 vs 半透明黑。半透明黑会把饱和色洗成灰（色相跑掉），
+  // darken 该把色相留住（紫色阴影仍是紫的）。
+  const blk = cv.clone();
+  applyOps(blk, [{ op: 'fill_ellipse', cx: 16, cy: 22, rx: 5, ry: 3, color: '#000000', alpha: 150 }]);
+  const b0 = px(blk, 16, 22);
+  // 用通道差衡量「有多灰」：max-min 越小越灰
+  const spread = (p) => Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
+  check('blend:darken 保住了底色色相（比叠半透明黑更不灰）',
+    spread(d0) > spread(b0), `darken 通道差 ${spread(d0)} vs 黑叠 ${spread(b0)}`);
+
+  // 透明像素上退化：没有可压暗的底色，退化成普通绘制，不该凭空出黑块
+  const empty = new Canvas(16, 16);
+  applyOps(empty, [{ op: 'fill_rect', x: 4, y: 4, w: 4, h: 4, color: '#7c3aed', blend: 'darken', alpha: 200 }]);
+  check('blend:darken 不会画到给定区域以外', px(empty, 3, 3)[3] === 0, `alpha=${px(empty, 3, 3)[3]}`);
+  check('blend:darken 在透明底上正常上色', px(empty, 4, 4)[3] > 150, `alpha=${px(empty, 4, 4)[3]}`);
+}
+
+// ------------------------------------------- auto_shade 光源方向
+{
+  const make = () => {
+    const cv = new Canvas(40, 40);
+    applyOps(cv, [{ op: 'fill_rect', x: 8, y: 8, w: 24, h: 24, color: '#7c3aed' }]);
+    return cv;
+  };
+  const bright = (p) => p[0] + p[1] + p[2];
+
+  const top = make();
+  applyOps(top, [{ op: 'auto_shade', amount: 0.35, dir: 'top' }]);
+  check('auto_shade dir:top 上亮下暗',
+    bright(px(top, 20, 10)) > bright(px(top, 20, 30)) + 40,
+    `${px(top, 20, 10).slice(0, 3).join()} vs ${px(top, 20, 30).slice(0, 3).join()}`);
+
+  const bottom = make();
+  applyOps(bottom, [{ op: 'auto_shade', amount: 0.35, dir: 'bottom' }]);
+  check('auto_shade dir:bottom 下亮上暗（背光）',
+    bright(px(bottom, 20, 30)) > bright(px(bottom, 20, 10)) + 40,
+    `${px(bottom, 20, 30).slice(0, 3).join()} vs ${px(bottom, 20, 10).slice(0, 3).join()}`);
+
+  const left = make();
+  applyOps(left, [{ op: 'auto_shade', amount: 0.35, dir: 'left' }]);
+  check('auto_shade dir:left 左亮右暗',
+    bright(px(left, 10, 20)) > bright(px(left, 30, 20)) + 40,
+    `${px(left, 10, 20).slice(0, 3).join()} vs ${px(left, 30, 20).slice(0, 3).join()}`);
+
+  const right = make();
+  applyOps(right, [{ op: 'auto_shade', amount: 0.35, dir: 'right' }]);
+  check('auto_shade dir:right 右亮左暗',
+    bright(px(right, 30, 20)) > bright(px(right, 10, 20)) + 40,
+    `${px(right, 30, 20).slice(0, 3).join()} vs ${px(right, 10, 20).slice(0, 3).join()}`);
+
+  const tl = make();
+  applyOps(tl, [{ op: 'auto_shade', amount: 0.35, dir: 'top-left' }]);
+  check('auto_shade dir:top-left 左上亮、右下暗',
+    bright(px(tl, 10, 10)) > bright(px(tl, 30, 30)) + 40,
+    `${px(tl, 10, 10).slice(0, 3).join()} vs ${px(tl, 30, 30).slice(0, 3).join()}`);
+
+  // 斜角方向要归一化：左上与正上在同等 amount 下的亮度差应接近
+  check('斜角方向归一化（亮度差不被拉伸）',
+    Math.abs(bright(px(tl, 10, 10)) - bright(px(top, 20, 10))) < 60,
+    `tl ${bright(px(tl, 10, 10))} vs top ${bright(px(top, 20, 10))}`);
+
+  // bevel 现在是真的斜向光，不再是 auto_shade 的别名
+  const bev = make();
+  applyOps(bev, [{ op: 'bevel', amount: 0.35 }]);
+  check('bevel 是左上亮右下暗',
+    bright(px(bev, 10, 10)) > bright(px(bev, 30, 30)) + 40,
+    `${px(bev, 10, 10).slice(0, 3).join()} vs ${px(bev, 30, 30).slice(0, 3).join()}`);
+}
+
+// ------------------------------------------- gradient_radial / dither / hue_rotate / symmetrize
+{
+  // 径向渐变：中心比边缘亮（用内亮外暗）
+  const cv = new Canvas(32, 32);
+  applyOps(cv, [{ op: 'gradient_radial', cx: 16, cy: 16, rx: 12, ry: 12, inner: '#ffffff', outer: '#7c3aed' }]);
+  const mid = px(cv, 16, 16);
+  const edge = px(cv, 16, 26);
+  check('gradient_radial 中心比边缘亮', mid[0] + mid[1] > edge[0] + edge[1] + 40,
+    `中 ${mid.slice(0, 3).join()} vs 边 ${edge.slice(0, 3).join()}`);
+  check('gradient_radial 不越出椭圆', px(cv, 0, 0)[3] === 0, `alpha=${px(cv, 0, 0)[3]}`);
+  check('gradient_radial 边界是外色', px(cv, 16, 27)[3] === 255);
+
+  // 有序抖动：区域内只有两种颜色，且都出现（棋盘格）
+  const dt = new Canvas(16, 16);
+  applyOps(dt, [{ op: 'dither', x: 0, y: 0, w: 8, h: 8, color1: '#000000', color2: '#ffffff', strength: 0.5 }]);
+  const seen = new Set();
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) seen.add(px(dt, x, y).slice(0, 3).join());
+  check('dither 只产生两种颜色', seen.size === 2, [...seen].join(' / '));
+  check('dither 不画到区域外', px(dt, 10, 10)[3] === 0);
+
+  // 色相偏移：紫色变蓝/红，但灰白描边不动
+  const hr = new Canvas(16, 16);
+  applyOps(hr, [
+    { op: 'fill_rect', x: 0, y: 0, w: 16, h: 8, color: '#7c3aed' },
+    { op: 'fill_rect', x: 0, y: 8, w: 16, h: 8, color: '#ffffff' },
+  ]);
+  const beforeHue = px(hr, 4, 4);
+  applyOps(hr, [{ op: 'hue_rotate', deg: 120 }]);
+  const afterHue = px(hr, 4, 4);
+  check('hue_rotate 真的变色了', beforeHue.join() !== afterHue.join(), `${beforeHue.slice(0, 3).join()} → ${afterHue.slice(0, 3).join()}`);
+  check('hue_rotate 不动白色区域', px(hr, 4, 12)[0] === 255 && px(hr, 4, 12)[1] === 255, px(hr, 4, 12).slice(0, 3).join());
+
+  // 对称化：左边画一半，镜像后两边一致
+  const sym = new Canvas(16, 16);
+  applyOps(sym, [{ op: 'fill_rect', x: 0, y: 4, w: 6, h: 8, color: '#22c55e' }]);
+  applyOps(sym, [{ op: 'symmetrize', axis: 'left' }]);
+  check('symmetrize 后左右一致', px(sym, 1, 8).join() === px(sym, 14, 8).join(),
+    `${px(sym, 1, 8).slice(0, 3).join()} vs ${px(sym, 14, 8).slice(0, 3).join()}`);
+  check('symmetrize 提升对称度', sym.symmetry() === 1, String(sym.symmetry()));
 }
 
 log(failed ? `\n${failed} 项失败` : '\nALL DRAW CHECKS PASSED');

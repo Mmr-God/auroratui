@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import { uid, fmtDuration } from '../util.js';
 import { detectShell } from '../config.js';
 import { jobs } from '../jobs.js';
+import { guardShellScope } from './scope.js';
 
 const MAX_OUT = 24 * 1024;
 const DEFAULT_TIMEOUT = 120_000;
@@ -26,7 +27,14 @@ export class ShellSession {
   }
 
   start() {
-    if (this.alive) return;
+    if (this.alive) return true;
+    // 重启前先把上一条命令的残渣清干净（旧 proc 的 marker 不能留给新命令）
+    this.buf = '';
+    this.waiters.length = 0;
+    // spawn 的 cwd 不存在时 Node 报的是 “spawn xxx ENOENT”（看起来像可执行文件找不到，
+    // 实际是目录没了）。团队/子代理常在某临时目录里干活、跑完就被删，
+    // 这时必须回退到现有目录，否则整个 shell 工具直接不可用。
+    if (!this.cwd || !safeIsDir(this.cwd)) this.cwd = process.cwd();
     const args = this.kind === 'posix' ? ['--noprofile', '--norc'] : this.kind === 'pwsh' ? ['-NoLogo', '-NoProfile', '-Command', '-'] : [];
     const env = {
       ...process.env,
@@ -39,13 +47,21 @@ export class ShellSession {
       COLUMNS: '200',
       AGENT_TUI: '1',
     };
-    this.proc = spawn(this.shellPath, args, {
-      cwd: this.cwd,
-      env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
+    try {
+      this.proc = spawn(this.shellPath, args, {
+        cwd: this.cwd,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (e) {
+      this.proc = null;
+      this.alive = false;
+      this.startError = `shell 没启动起来（${this.shellPath}）：${e?.message || e}`;
+      return false;
+    }
     this.alive = true;
+    this.startError = '';
     // 记下这一份 proc：中断/超时会 kill() 并重启，旧进程的 exit 事件不能把
     // 新会话的 waiter 当成“shell 已死”给解决掉。
     const proc = this.proc;
@@ -56,21 +72,31 @@ export class ShellSession {
     };
     proc.stdout.on('data', onData);
     proc.stderr.on('data', onData);
-    proc.on('exit', () => {
+    proc.on('exit', (code, sig) => {
+      if (process.env.SHDIAG) console.error('[EXIT] pid=' + proc.pid + ' code=' + code + ' sig=' + sig + ' same=' + (this.proc === proc) + ' buf=' + JSON.stringify(this.buf.slice(0,80)) + ' waiters=' + this.waiters.length);
       if (this.proc !== proc) return;
       this.alive = false;
-      this._flush(true);
+      this._flush(true, proc);
+      // flush 之后再置 null：让下一次 _runOnce 的“进程已死”判定一定命中
+      this.proc = null;
     });
-    proc.on('error', () => {
+    proc.on('error', (e) => {
+      if (process.env.SHDIAG) console.error('[ERR] pid=' + proc.pid + ' msg=' + e.message + ' same=' + (this.proc === proc));
       if (this.proc !== proc) return;
       this.alive = false;
-      this._flush(true);
+      this._flush(true, proc);
+      this.proc = null;
     });
   }
 
-  _flush(dead = false) {
+  _flush(dead = false, dyingProc = null) {
     if (!this.waiters.length) return;
     const w = this.waiters[0];
+    // 死消息只对「死在它自己那个进程上」的 waiter 有效：shell 重启后
+    // 旧进程的 exit/error 事件可能晚一步到达，不能把新会话的 waiter 当成
+    // “shell 已死”抹成 142（表现为跑 echo 返回「被用户中断」）。
+    // dyingProc 明确告知“死的是哪个 proc”，不能用 this.proc 比（它可能已被置 null）。
+    if (dead && dyingProc && w.proc !== dyingProc) return;
     const idx = this.buf.indexOf(w.marker);
     if (idx >= 0) {
       const raw = this.buf.slice(0, idx);
@@ -99,16 +125,43 @@ export class ShellSession {
   }
 
   async _runOnce(command, timeout, onProgress, signal) {
-    this.start();
-    if (!this.alive) {
-      // restart once
+    // 进程死了（比如上一条命令就是 `exit 3`）就重开一份。
+    // 坑：不能只看 this.alive —— `exit` 事件是异步的，命令返回时事件可能还没送到，
+    // 这时 alive 仍是 true，于是命令被写进已死进程的 stdin，随后的 error/exit
+    // 回调把**新** waiter 当成“shell 已死”抹成 142「被用户中断」。
+    // stdin.writable 在进程死时立刻变 false，比 exit 事件早，是可靠的存活探针。
+    const proc0 = this.proc;
+    const processGone =
+      !this.alive ||
+      !proc0 ||
+      proc0.exitCode !== null ||
+      proc0.signalCode !== null ||
+      !proc0.stdin ||
+      proc0.stdin.destroyed ||
+      proc0.stdin.writable === false;
+    if (processGone) {
       this.proc = null;
-      this.start();
+      this.buf = '';
+      this.waiters.length = 0;
+      const started = this.start();
+      if (started === false || !this.proc) {
+        // 启动失败（shell 丢了 / cwd 不可用）：直接给出人看得懂的错误，
+        // 不要 push waiter 到没有进程的队列里等满超时。
+        return {
+          out: this.startError || 'shell 没能启动',
+          code: 127,
+          dur: 0,
+          startFailed: true,
+        };
+      }
     }
     const marker = `__AGENT_${uid()}__`;
+    // posix 分支上面已经用 __agent_rc 存下了真实退出码，这里必须读变量；
+    // 直接写 "$?" 拿到的是 `__agent_rc=$?` 这条赋值语句自己的状态（永远是 0），
+    // 会让所有 bash 命令都报 code=0，验收/失败判定全失灵。
     const markerLine =
       this.kind === 'posix'
-        ? `printf '\\n%s:%s:%s\\n' '${marker}' "$?" "$PWD"`
+        ? `printf '\\n%s:%s:%s\\n' '${marker}' "$__agent_rc" "$PWD"`
         : this.kind === 'pwsh'
           ? `Write-Output ("${marker}:$($LASTEXITCODE):$(Get-Location)")`
           : `echo ${marker}:%errorlevel%:%CD%`;
@@ -123,7 +176,7 @@ export class ShellSession {
     const started = Date.now();
     const result = await new Promise((resolve) => {
       let done = false;
-      const waiter = { marker: `${marker}:`, resolve: null };
+      const waiter = { marker: `${marker}:`, resolve: null, proc: this.proc };
       const finish = (r) => {
         if (done) return;
         done = true;
@@ -135,14 +188,15 @@ export class ShellSession {
       waiter.resolve = finish;
       this.waiters.push(waiter);
       const tick = setInterval(() => onProgress?.(this.buf.slice(-2000)), 500);
-      const timer = setTimeout(() => {
+      // timeout <= 0 表示不限时（后台任务用），绝不能传给 setTimeout（0 会立刻触发）
+      const timer = timeout > 0 ? setTimeout(() => {
         const i = this.waiters.indexOf(waiter);
         if (i >= 0) this.waiters.splice(i, 1);
         this.kill();
         const out = this.buf + `\n[命令超时 ${fmtDuration(timeout)}，已终止 shell]`;
         this.buf = '';
         finish({ out, code: 124, timedOut: true });
-      }, timeout);
+      }, timeout) : null;
       // 用户按 ESC/Ctrl+C：立刻杀掉整棵进程树，不等它自己跑完
       const onAbort = () => {
         const i = this.waiters.indexOf(waiter);
@@ -185,13 +239,26 @@ export class ShellSession {
       }
     } catch {}
     this.alive = false;
-    // 外部（浏览器面板）杀掉时，正在等的 waiter 必须立刻收到结果，否则会挂到超时。
-    this._flush(true);
+    // 外部（jobs.kill）杀掉时，正在等的 waiter 必须立刻收到结果，否则会挂到超时。
+    this._flush(true, this.proc);
     this.proc = null;
+    // 缓冲和队列必须一起清：这份 session 会被 getShell() 复用，
+    // 残留的 buf 里还带着上一条命令的 marker，下一次命令一读就会拿到旧结果
+    // （表现为「跑 echo 却返回 142 被中断」）。
+    this.buf = '';
+    this.waiters.length = 0;
   }
 
   dispose() {
     this.kill();
+  }
+}
+
+function safeIsDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
   }
 }
 
@@ -218,11 +285,23 @@ function truncate(s) {
 }
 
 let sharedSession = null;
+/**
+ * 一个进程只留一份常驻 shell（**懒启动**）。
+ *
+ * 以前的写法是「第一次用就 new 一份并且立刻 start()」。问题在 Windows 上很扎眼：
+ * Git Bash 的 bash.exe 会拉一整串 Git for Windows 的进程（usr/bin/bash + 控制台宿主
+ * + git 辅助进程），每份十几 MB；玩家开几个 agent 窗口就是好几份，加起来非常可观。
+ * 更要命的是测试 / 子进程只要 import 了本模块就可能早早把 bash 拉起来。
+ *
+ * 现在改成：
+ *   · 没真跑命令之前不起进程（第一次 shell 调用才 start）
+ *   · 一个进程内复用同一份（持久 cwd/env 本来就要这个语义）
+ *   · 进程退出时 bin/agent.js 的 finally 会 disposeShell()，不会留在后台
+ */
 export function getShell(cwd) {
-  if (!sharedSession || !sharedSession.alive) {
-    sharedSession = new ShellSession({ cwd: cwd || process.cwd() });
-    sharedSession.start();
-  }
+  if (sharedSession) return sharedSession;
+  sharedSession = new ShellSession({ cwd: cwd || process.cwd() });
+  // 这里不 start()：交给 _runOnce 在真的要跑命令时启动（懒启动，省进程/内存）
   return sharedSession;
 }
 export function disposeShell() {
@@ -230,26 +309,80 @@ export function disposeShell() {
   sharedSession = null;
 }
 
+/**
+ * 后台运行：不 await，立刻把 jobId 还给模型。
+ * 之所以还是走同一个 shell：持久会话的 cwd/env 是模型已经习惯的东西，
+ * 另起进程反而会让 `cd` 之类的状态对不上。代价是后台命令跑着的时候，
+ * 下一条前台命令会排队等它（ShellSession.run 里有串行队列）——这点写进了工具描述里。
+ */
+function runBackground(command, ctx) {
+  const shell = getShell(ctx.cwd);
+  const job = jobs.add({
+    command,
+    cwd: shell.cwd || ctx.cwd,
+    source: ctx.depth ? `子代理(层${ctx.depth})` : '主代理',
+    session: ctx.sessionId || '',
+    timeout: 0,
+    background: true,
+  });
+  job.kill = () => shell.kill();
+  // 不 await：这里就是要立刻返回。但仍要挂 catch，否则失败会变成未处理的 rejection。
+  shell
+    .run(command, {
+      timeout: 0, // 0 = 不限时，后台命令自己负责退出（由 jobs.kill 收尾）
+      onProgress: (t) => jobs.progress(job.id, t),
+      signal: ctx.signal,
+    })
+    .then((r) => {
+      jobs.end(job.id, {
+        code: r.code,
+        dur: r.dur,
+        output: r.out,
+        truncated: r.truncated,
+        status: r.aborted ? 'killed' : r.timedOut ? 'timeout' : r.killed ? 'killed' : r.code === 0 ? 'ok' : 'error',
+      });
+    })
+    .catch((e) => {
+      jobs.end(job.id, { code: 1, output: `后台任务异常: ${e?.message || e}`, status: 'error' });
+    });
+  return {
+    content:
+      `已在后台启动（jobId=${job.id}）：${command}\n` +
+      '用 jobs 工具 action="tail" 看它的实时输出，action="list" 看所有任务，action="kill" 终止它。\n' +
+      '注意：它还在跑的时候，下一条前台 shell 命令会排队等它结束。',
+    meta: { kind: 'shell', command, background: true, jobId: job.id },
+  };
+}
+
 export const shellTool = {
   name: 'shell',
   label: 'Shell',
   description:
     '在持久化的 shell 会话中执行命令（cwd 与环境在多次调用间保留）。适合搜索、git、构建、测试、列目录。' +
-    '输出过长会自动截断。不要用它来读整文件（用 read），也不要用来改文件（用 edit/write）。',
+    '输出过长会自动截断。不要用它来读整文件（用 read），也不要用来改文件（用 edit/write）。\n' +
+    'background=true 时命令在后台跑、立刻返回 jobId（适合 dev server、长时间构建、watch 模式）；' +
+    '之后用 jobs 工具（action=tail/kill）看输出和终止它。注意后台命令仍占着这个 shell，' +
+    '下一条前台命令会等它跑完——需要同时跑多条就只能先收工或 kill。',
   readOnly: false,
   parameters: {
     type: 'object',
     properties: {
       command: { type: 'string', description: '要执行的命令' },
       timeout: { type: 'number', description: '超时毫秒数（默认 120000）' },
+      background: { type: 'boolean', description: '后台运行：立刻返回 jobId，不阻塞对话（之后用 jobs 工具查输出/终止）' },
     },
     required: ['command'],
   },
   async execute(input, ctx) {
     if (!input.command) return { isError: true, content: '缺少 command 参数' };
+    // 团队成员的「文件范围」：fs/patch 已拦，但 shell 是个后门（echo x > 同事的文件）。
+    // 只有带 writeScope 的上下文（团队成员）才会真的检查，主代理/单发子代理不受影响。
+    const denied = guardShellScope(input.command, ctx);
+    if (denied) return denied;
+    if (input.background) return runBackground(String(input.command), ctx);
     const shell = getShell(ctx.cwd);
     const timeout = Math.max(5000, Math.min(600_000, Number(input.timeout) || DEFAULT_TIMEOUT));
-    // 登记到浏览器后端：玩家能看到每条 shell 的命令、实时尾巴、退出码，并能手动终止。
+    // 登记到 job 表：玩家能看到每条 shell 的命令、实时尾巴、退出码，并能手动终止（jobs.list/kill）。
     const job = jobs.add({
       command: String(input.command),
       cwd: shell.cwd || ctx.cwd,

@@ -12,6 +12,11 @@ function resolve(ctx, p) {
   return path.isAbsolute(p) ? p : path.resolve(ctx.cwd, p);
 }
 
+/** 供其他工具（patch）复用同一套路径解析。 */
+export function resolvePath(ctx, p) {
+  return resolve(ctx, p);
+}
+
 /** True when `file` lives inside the workspace directory `cwd`. */
 function insideCwd(ctx, file) {
   const cwd = path.resolve(ctx.cwd || process.cwd());
@@ -24,7 +29,35 @@ function insideCwd(ctx, file) {
  * Workspace guard: writing outside the workspace requires the user to have turned
  * on 全权模式 (/trust) — otherwise we refuse and tell the model what to say.
  */
-function guardWrite(ctx, file, what) {
+export function guardWrite(ctx, file, what) {
+  // 团队成员的「文件范围」：只允许改自己负责的文件。
+  // 靠提示词约束不够（实测成员会顺手去改同事的文件、或替同事打补丁），这里是真的拦。
+  const scope = Array.isArray(ctx?.writeScope) && ctx.writeScope.length ? ctx.writeScope : null;
+  if (scope) {
+    const cwd = path.resolve(ctx.cwd || process.cwd());
+    const abs = path.resolve(file);
+    const rel = path.relative(cwd, abs).split(path.sep).join('/');
+    const ok = scope.some((raw) => {
+      const s = String(raw || '').trim().replace(/\\/g, '/');
+      if (!s) return false;
+      // 以 / 结尾，或者名字里没有扩展名 → 当目录前缀匹配；否则当精确文件
+      const isDir = s.endsWith('/') || !/\.[A-Za-z0-9]+$/.test(s);
+      const pat = s.replace(/^\.\//, '').replace(/\/+$/, '');
+      if (!pat) return false;
+      return isDir ? rel === pat || rel.startsWith(pat + '/') : rel === pat;
+    });
+    // 越出工作区的交给下面的全权模式检查（这里只管团队内部文件划分）
+    if (!ok && insideCwd(ctx, abs)) {
+      return {
+        isError: true,
+        content:
+          `${what}被拒绝：${rel} 不在你负责的文件范围内。\n` +
+          `你负责的是：${scope.join(', ')}\n` +
+          '团队里每个人只写自己那份，不要改同事的文件（他们正在改，会互相覆盖）。\n' +
+          '如果确实必须改，就在最终交代里说明理由，让队长来统一处理。',
+      };
+    }
+  }
   if (!ctx || ctx.allowOutside) return null;
   if (insideCwd(ctx, file)) return null;
   return {
@@ -150,7 +183,7 @@ export const readTool = {
       if (buf.length > MAX_IMAGE_BYTES) {
         return {
           isError: true,
-          content: `图片过大 (${fmtBytes(buf.length)})，单张上限 ${fmtBytes(MAX_IMAGE_BYTES)}。先用 shell 缩小：\n  ffmpeg -i "${file}" -vf scale=1280:-1 out.png\n或用 browser 工具的 screenshot 重新截图。`,
+          content: `图片过大 (${fmtBytes(buf.length)})，单张上限 ${fmtBytes(MAX_IMAGE_BYTES)}。先用 shell 缩小：\n  ffmpeg -i "${file}" -vf scale=1280:-1 out.png\n或直接传给模型看更小的一张。`,
           meta: { kind: 'read', path: file },
         };
       }

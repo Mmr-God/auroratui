@@ -381,9 +381,10 @@ export const PARTS = [
   {
     key: "shine",
     label: "高光",
-    hint: "斜向白色高光条，给球体/宝石/金属加体积感",
+    hint: "斜向白色高光条，给球体/宝石/金属加体积感（按底色提亮，不会盖住渐变）",
     palette: { main: "#ffffff", accent: "#ffffff" },
     sym: false,
+    blend: "lighten",
     auto: { ax: 0.42, ay: 0.28 },
     draw(c, p) {
       seg(c, 0.2, 0.44, 0.52, 0.16, p.white, 190, 0.8);
@@ -543,13 +544,19 @@ export function drawPartInto(cv, key, opts = {}) {
   }
   const ox = Math.round(Number(opts.x ?? defX) - (topLeft ? 0 : area / 2));
   const oy = Math.round(Number(opts.y ?? defY) - (topLeft ? 0 : area / 2));
+  // 半透明部件（腮红/地影/高光）交给 setPx 的 auto 模式：彩色叠彩色走 hue
+  // （否则粉腮红叠在绿身上会变成灰），黑/灰阴影仍走普通叠色（该压暗就压暗）。
+  // 不透明像素不受影响。
+  // 但高光（shine/sparkle）例外：它需要按底色「提亮」而不是刷平色，否则会在
+  // auto_shade 的渐变上贴一块硬补丁。部件可以用 blend:'lighten' 声明。
+  const blend = part.blend || "auto";
   for (let y = 0; y < area; y++) {
     for (let x = 0; x < area; x++) {
       const i = (y * area + x) * 4;
       const a = c.data[i + 3];
       if (a < 8) continue;
       const hex = `#${[c.data[i], c.data[i + 1], c.data[i + 2]].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
-      cv.setPx(ox + x, oy + y, hex, a);
+      cv.setPx(ox + x, oy + y, hex, a, blend);
     }
   }
   return true;

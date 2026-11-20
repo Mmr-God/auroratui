@@ -261,6 +261,309 @@ export function quotePath(p) {
   return /[\s"']/.test(s) ? `"${s.replace(/"/g, '')}"` : s;
 }
 
+// ------------------------------------------------- 非文本剪贴板（文件 / 图片 / 其它）
+// 终端里粘贴什么都得变成「能写进输入框的字符」。文本就直接贴；
+// 复制的是文件、截图、或者别的什么二进制，就把**路径**贴进去 ——
+// 这样不管剪贴板里是什么东西，模型都能用 read 工具拿到（read 支持图片与二进制提示）。
+//
+// 优先级：文本 > 文件（资源管理器里 Ctrl+C 复制的文件）> 图片（截图）> 其它可落盘的东西。
+// 文本优先级最高是故意的：复制一段文字时绝不能因为系统同时挂了图片格式就贴成路径。
+
+/** 文件扩展名 → 写临时文件时用的后缀（没有合适的就用 .bin）。 */
+function extOf(name, mime) {
+  const e = path.extname(String(name || '')).toLowerCase();
+  if (e) return e;
+  if (/^image\/png/.test(mime)) return '.png';
+  if (/^image\/jpe?g/.test(mime)) return '.jpg';
+  if (/^image\/gif/.test(mime)) return '.gif';
+  if (/^image\/webp/.test(mime)) return '.webp';
+  if (/^image\/bmp/.test(mime)) return '.bmp';
+  if (/pdf/.test(mime)) return '.pdf';
+  if (/zip/.test(mime)) return '.zip';
+  return '.bin';
+}
+
+// Windows：一次性问出「文本 / 文件列表 / 有没有图 / 有没有其它格式」。
+// Get-Clipboard -Raw 读文本，GetFileDropList 读资源管理器复制的文件，
+// GetDataObject().GetFormats() 告诉你还有没有别的（比如 Excel 的嵌套对象）。
+const WIN_ANY = `param([string]$Out)
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$txt = [System.Windows.Forms.Clipboard]::GetText()
+if ($null -ne $txt -and $txt.Length -gt 0) {
+  [Console]::Out.Write('TEXT:' + $txt)
+  exit 0
+}
+$files = [System.Windows.Forms.Clipboard]::GetFileDropList()
+if ($null -ne $files -and $files.Count -gt 0) {
+  foreach ($f in $files) { [Console]::Out.WriteLine('FILE:' + $f) }
+  exit 0
+}
+$img = [System.Windows.Forms.Clipboard]::GetImage()
+if ($null -ne $img) {
+  $img.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+  $img.Dispose()
+  [Console]::Out.Write('IMAGE')
+  exit 0
+}
+$fmts = [System.Windows.Forms.Clipboard]::GetDataObject().GetFormats()
+if ($null -ne $fmts -and $fmts.Count -gt 0) {
+  [Console]::Out.Write('FORMATS:' + ($fmts -join '|'))
+  exit 0
+}
+[Console]::Out.Write('NONE')
+`;
+
+/** 把一个二进制格式名变成能落盘的临时文件（尽量从剪贴板里抽出真实字节）。 */
+const WIN_SAVE_PS = `param([string]$Fmt, [string]$Out)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+$d = [System.Windows.Forms.Clipboard]::GetDataObject()
+$v = $d.GetData($Fmt)
+if ($v -is [System.IO.Stream]) {
+  $fs = [System.IO.File]::Create($Out)
+  $v.Position = 0
+  $v.CopyTo($fs)
+  $fs.Close()
+  [Console]::Out.Write('SAVED')
+  exit 0
+}
+if ($v -is [byte[]]) {
+  [System.IO.File]::WriteAllBytes($Out, $v)
+  [Console]::Out.Write('SAVED')
+  exit 0
+}
+if ($v -is [string]) {
+  [System.IO.File]::WriteAllText($Out, $v, [Text.Encoding]::UTF8)
+  [Console]::Out.Write('SAVED')
+  exit 0
+}
+[Console]::Out.Write('SKIP')
+`;
+
+/** macOS/Linux：列出剪贴板里可用的 MIME 类型。 */
+async function mimeList() {
+  if (MAC) {
+    const r = await run('osascript', ['-e', 'clipboard info']);
+    if (r.ok) {
+      const mimes = [];
+      if (/«class PNGf»/.test(r.out)) mimes.push('image/png');
+      if (/«class furl».*|text\/uri-list/.test(r.out)) mimes.push('text/uri-list');
+      if (/«class TIFF»/.test(r.out)) mimes.push('image/tiff');
+      return { ok: true, mimes };
+    }
+    return { ok: false, mimes: [] };
+  }
+  const r = await run('wl-paste', ['--list-types']);
+  if (r.ok) return { ok: true, mimes: r.out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) };
+  const x = await run('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o']);
+  if (x.ok) return { ok: true, mimes: x.out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) };
+  return { ok: false, mimes: [] };
+}
+
+/** Linux/macOS：把 text/uri-list 里的 file:// URI 转成本地路径。 */
+async function uriListPaths() {
+  if (WIN) return [];
+  let raw = '';
+  if (MAC) {
+    // macOS 的「复制文件」不是 uri-list，而是 set the clipboard to {«class furl»}: 用 AppleScript 取
+    const r = await run('osascript', ['-e', 'try\nset theFiles to the clipboard as «class furl»\nreturn POSIX path of theFiles\non error\nreturn ""\nend try'], { timeout: 6000 });
+    if (r.ok && r.out.trim()) return [r.out.trim()];
+    return [];
+  }
+  const r = await run('wl-paste', ['--no-newline', '--type', 'text/uri-list'], { timeout: 4000 });
+  if (!r.ok) {
+    const x = await run('xclip', ['-selection', 'clipboard', '-t', 'text/uri-list', '-o'], { timeout: 4000 });
+    if (x.ok) raw = x.out;
+  } else raw = r.out;
+  if (!raw.trim()) return [];
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const l = line.trim();
+    if (!/^file:\/\//i.test(l)) continue;
+    try {
+      // file:///home/a b/c.txt → /home/a b/c.txt
+      out.push(decodeURIComponent(l.replace(/^file:\/\/\/(?=[A-Za-z]:)/i, '').replace(/^file:\/\//i, '/')));
+    } catch {}
+  }
+  return out;
+}
+
+/**
+ * 读剪贴板，**不管里面是什么都给出一份能粘进输入框的内容**。
+ *
+ * @returns {{ok:boolean, kind:'text'|'files'|'image'|'blob'|'empty', text:string,
+ *            paths:string[], note:string, err?:string}}
+ *   kind='text' 时 text 是原文；其余种类 text 是已经拼好的路径串（带引号，空格安全）。
+ */
+export async function readClipboardAny({ dir, name } = {}) {
+  const outDir = dir || os.tmpdir();
+  const mkOut = (ext) =>
+    path.join(outDir, name || `agent-clip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext || '.bin'}`);
+
+  // ---- 测试钩子 1：整块结果直接注入（最灵活，可以造任何 kind）
+  const stub = process.env.AGENT_CLIPBOARD_ANY_STUB;
+  if (stub !== undefined) {
+    try {
+      return { ok: true, kind: 'empty', text: '', paths: [], note: '', stub: true, ...JSON.parse(stub) };
+    } catch {
+      return { ok: true, kind: 'empty', text: '', paths: [], note: '', stub: true };
+    }
+  }
+
+  // ---- 测试钩子 2：沿用旧的三个单点 stub（文本 / 图片 / 文件）。
+  // 只要设了其中任何一个，就**完全不碰真实剪贴板**——测试绝不能依赖开发者当时复制了什么。
+  // 优先级和真实路径一致：文本 > 文件 > 图片。
+  const textStub = process.env.AGENT_CLIPBOARD_STUB;
+  const imgStub = process.env.AGENT_CLIPBOARD_IMAGE_STUB;
+  const fileStub = process.env.AGENT_CLIPBOARD_FILE_STUB;
+  if (textStub !== undefined || imgStub !== undefined || fileStub !== undefined) {
+    if (textStub && textStub !== '1') {
+      return { ok: true, kind: 'text', text: textStub, paths: [], note: '', stub: true };
+    }
+    if (fileStub) {
+      let files = [];
+      try {
+        const parsed = JSON.parse(fileStub);
+        files = Array.isArray(parsed) ? parsed : [String(parsed)];
+      } catch {
+        files = fileStub.split('|').map((s) => s.trim()).filter(Boolean);
+      }
+      if (files.length) {
+        return { ok: true, kind: 'files', text: files.map(quotePath).join(' '), paths: files, note: `复制了 ${files.length} 个文件，已改成路径`, stub: true };
+      }
+    }
+    if (imgStub && imgStub !== '1') {
+      return { ok: true, kind: 'image', text: quotePath(imgStub), paths: [imgStub], note: '剪贴板里是图片，已存成临时文件', stub: true };
+    }
+    return { ok: false, kind: 'empty', text: '', paths: [], note: '', err: '剪贴板是空的（文本 / 文件 / 图片都没有）', stub: true };
+  }
+
+  // ---- 1) 文本（最高优先级）
+  const t = await readClipboard();
+  if (t.ok && t.text && t.text.trim()) {
+    return { ok: true, kind: 'text', text: t.text, paths: [], note: '' };
+  }
+
+  // ---- 2/3/4) 非文本：文件 / 图片 / 其它
+  if (WIN) {
+    const ps1 = path.join(os.tmpdir(), `agent-clip-any-${process.pid}-${Date.now()}.ps1`);
+    const imgOut = mkOut('.png');
+    try {
+      fs.writeFileSync(ps1, WIN_ANY, 'utf8');
+      const r = await run(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-Out', imgOut],
+        { timeout: 15000 }
+      );
+      const out = r.out || '';
+      if (out.startsWith('FILE:')) {
+        const files = out
+          .split(/\r?\n/)
+          .filter((l) => l.startsWith('FILE:'))
+          .map((l) => l.slice(5).trim())
+          .filter(Boolean);
+        if (files.length) {
+          return { ok: true, kind: 'files', text: files.map(quotePath).join(' '), paths: files, note: `复制了 ${files.length} 个文件，已改成路径` };
+        }
+      }
+      if (out.includes('IMAGE')) {
+        if (fileHasBytes(imgOut)) {
+          return { ok: true, kind: 'image', text: quotePath(imgOut), paths: [imgOut], note: '剪贴板里是图片，已存成临时文件' };
+        }
+        return { ok: false, kind: 'empty', text: '', paths: [], note: '', err: '剪贴板图片是 0 字节' };
+      }
+      const fm = /FORMATS:([^\r\n]*)/.exec(out);
+      if (fm) {
+        // 有格式但没有文本/文件/图：挑一个能落盘的试试（Excel 单元格、HTML 片段等）
+        const fmts = fm[1].split('|').map((s) => s.trim()).filter(Boolean);
+        const pick = fmts.find((f) => /FileGroupDescriptor|Bitmap|DIB|PNG|HTML|Text/i.test(f)) || fmts[0];
+        if (pick) {
+          const blobOut = mkOut(extOf('', pick));
+          const ps2 = path.join(os.tmpdir(), `agent-clip-save-${process.pid}-${Date.now()}.ps1`);
+          try {
+            fs.writeFileSync(ps2, WIN_SAVE_PS, 'utf8');
+            const r2 = await run(
+              'powershell.exe',
+              ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps2, '-Fmt', pick, '-Out', blobOut],
+              { timeout: 15000 }
+            );
+            if ((r2.out || '').includes('SAVED') && fileHasBytes(blobOut)) {
+              return {
+                ok: true,
+                kind: 'blob',
+                text: quotePath(blobOut),
+                paths: [blobOut],
+                note: `剪贴板里是「${pick}」，已存成临时文件并贴入路径`,
+              };
+            }
+          } finally {
+            try {
+              fs.unlinkSync(ps2);
+            } catch {}
+          }
+          return {
+            ok: false,
+            kind: 'empty',
+            text: '',
+            paths: [],
+            err: `剪贴板里只有「${pick}」这种格式，读不出可用的字节（可以先把内容存成文件再复制文件）`,
+          };
+        }
+      }
+    } catch (e) {
+      return { ok: false, kind: 'empty', text: '', paths: [], err: e.message };
+    } finally {
+      try {
+        fs.unlinkSync(ps1);
+      } catch {}
+      // 没被用上的临时图删掉，别在 tmp 里堆垃圾
+      try {
+        if (!fileHasBytes(imgOut) || (t.ok && t.text && t.text.trim())) fs.unlinkSync(imgOut);
+      } catch {}
+    }
+  } else {
+    // macOS / Linux：先看有没有 file:// 列表（资源管理器复制文件走这条）
+    const uris = await uriListPaths();
+    if (uris.length) {
+      return { ok: true, kind: 'files', text: uris.map(quotePath).join(' '), paths: uris, note: `复制了 ${uris.length} 个文件，已改成路径` };
+    }
+    // 再试图片
+    const img = await readClipboardImage({ dir: outDir });
+    if (img.ok && (img.path || img.paths?.length)) {
+      const paths = img.paths && img.paths.length ? img.paths : [img.path];
+      return { ok: true, kind: 'image', text: paths.map(quotePath).join(' '), paths, note: '剪贴板里是图片，已存成临时文件' };
+    }
+    // 最后看看有没有我们认得的二进制格式
+    const { ok: hasList, mimes } = await mimeList();
+    if (hasList && mimes.length) {
+      const bin = mimes.find((m) => !/^text\/plain$|^UTF8_STRING$|^STRING$|^TARGETS$/i.test(m));
+      if (bin) {
+        const blobOut = mkOut(extOf('', bin));
+        const cmdList = MAC
+          ? [['osascript', ['-e', `try\nset d to the clipboard as «class ${/png/i.test(bin) ? 'PNGf' : 'TIFF'}»\nset fh to open for access POSIX file "${blobOut.replace(/"/g, '\\"')}" with write permission\nwrite d to fh\nclose access fh\nreturn "SAVED"\non error\nreturn "SKIP"\nend try`]]]
+          : [['wl-paste', ['--no-newline', '--type', bin]], ['xclip', ['-selection', 'clipboard', '-t', bin, '-o']]];
+        for (const [cmd, args] of cmdList) {
+          const rr = MAC ? await run(cmd, args, { timeout: 8000 }) : await runToFile(cmd, args, blobOut);
+          const good = MAC ? (rr.out || '').includes('SAVED') && fileHasBytes(blobOut) : rr.ok && fileHasBytes(blobOut);
+          if (good) {
+            return { ok: true, kind: 'blob', text: quotePath(blobOut), paths: [blobOut], note: `剪贴板里是「${bin}」，已存成临时文件并贴入路径` };
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    kind: 'empty',
+    text: '',
+    paths: [],
+    err: t.ok ? '剪贴板是空的' : t.err || '剪贴板不可用',
+  };
+}
+
 /**
  * Put text on the OS clipboard.
  * `fallback` (optional) receives an OSC 52 byte sequence to write to the tty when

@@ -1,8 +1,8 @@
 {
   "name": "auroratui",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
-  "description": "AuroraTui — 终端里的 AI 编程代理（零依赖 TUI，支持子代理与浏览器团队面板）",
+  "description": "AuroraTui — 终端里的 AI 编程代理（零依赖 TUI，支持子代理与团队并行开发）",
   "bin": {
     "auroratui": "bin/agent.js",
     "agent": "bin/agent.js"

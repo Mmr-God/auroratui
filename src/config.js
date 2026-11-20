@@ -38,12 +38,14 @@ const DEFAULTS = {
     subagentDepth: 1, // 子代理还能不能再派子代理（1 = 只有主代理能派）
     subagentMaxSteps: 40, // 单个子代理最多走多少步（防止跑飞）
     subagentTimeout: 600, // 单个子代理超时（秒）；到点先让它收尾交代，再硬断
+    subagentModel: '', // 子代理默认模型（空 = 跟主代理一样）；填便宜模型可省钱，例 "deepseek-v4-flash"
+    teamShow: true, // 主界面下方显示团队成员的实时工具调用行（/teamShow 开关）
     teamConcurrency: 2, // 团队成员同时跑几个（越大越快也越烧 token）
+    teamMemberModel: '', // 团队成员默认模型（空 = 跟主代理一样）。成员里写 model 的以成员为准；填便宜模型能省一大笔
     teamMaxMembers: 10, // 一支团队最多几个成员
+    teamBudget: 0, // 团队成本上限（美元）：花到就自动停发新活（0 = 不限）。防止跑到一半发现烧了好几块
     teamMemberTimeout: 1800, // 团队成员的时间上限（秒）——比子代理宽松得多，成员要真的把活干完
     plugins: true, // 启动时自动加载 plugins/ 下的插件（draw 画板等）；false = 全关
-    progress: true, // 浏览器团队面板（用到子代理/团队时自动开，绑定 127.0.0.1）
-    progressPort: 7870, // 面板端口（被占用时自动往后找）
   },
   hooks: { preToolUse: [], postToolUse: [] },
   customProviders: {},
@@ -224,12 +226,6 @@ export class Config {
     this.data.settings.team = !!v;
     this.save();
     return this.data.settings.team;
-  }
-
-  setProgress(v) {
-    this.data.settings.progress = !!v;
-    this.save();
-    return this.data.settings.progress;
   }
 
   setAllowOutside(v) {
